@@ -37,7 +37,7 @@ tar = { version = "0.4", default-features = false }
 bzip2 = "0.6"
 
 [target.'cfg(target_os = "windows")'.dependencies]
-windows-sys = { version = "=0.61.2", features = ["Win32_Foundation", "Win32_Security", "Win32_System_JobObjects", "Win32_System_Pipes", "Win32_System_Threading"] }
+windows-sys = { version = "=0.61.2", features = ["Win32_Foundation", "Win32_Security", "Win32_Security_Authorization", "Win32_Storage_FileSystem", "Win32_System_SystemServices", "Win32_System_JobObjects", "Win32_System_Pipes", "Win32_System_Threading"] }
 
 # The computer-control helper (S24) is macOS only.
 [target.'cfg(target_os = "macos")'.dependencies]

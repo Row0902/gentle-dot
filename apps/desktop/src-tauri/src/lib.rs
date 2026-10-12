@@ -17,6 +17,8 @@ pub mod disclaimed;
 pub mod geometry;
 pub mod health;
 #[cfg(target_os = "windows")]
+mod isolated_bootstrap_windows;
+#[cfg(target_os = "windows")]
 mod owned_process_windows;
 pub mod platform;
 pub mod position;
