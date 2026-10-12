@@ -31,7 +31,7 @@ describe("posix mode helper", () => {
 		expect(() => expectPosixExecutable(file, "linux")).toThrow();
 	});
 
-	it("skips and warns exactly once on Windows, for stat and lstat alike", () => {
+	it("skips and warns on every gated assertion, so no skip is silently green", () => {
 		const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
 		try {
 			const file = join(tempDir(), "private");
@@ -41,9 +41,13 @@ describe("posix mode helper", () => {
 			expect(() => expectPosixLstatMode(file, 0o600, "win32")).not.toThrow();
 			expect(() => expectPosixMode(file, 0o644, "win32")).not.toThrow();
 			expect(() => expectPosixExecutable(file, "win32")).not.toThrow();
-			expect(warn).toHaveBeenCalledTimes(1);
-			expect(warn.mock.calls[0]?.[0]).toContain("odd/tasks/windows-port.md");
-			expect(warn.mock.calls[0]?.[0]).toContain("ACL");
+			// Every gated assertion that skips must say so: a once-per-process warning leaves the
+			// later ones green in silence, and the guarantee must hold per test, not per run.
+			expect(warn).toHaveBeenCalledTimes(4);
+			for (const call of warn.mock.calls) {
+				expect(call[0]).toContain("odd/tasks/windows-port.md");
+				expect(call[0]).toContain("ACL");
+			}
 		} finally {
 			warn.mockRestore();
 		}

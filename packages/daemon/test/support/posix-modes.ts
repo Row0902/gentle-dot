@@ -4,8 +4,9 @@
 // be asserted to be `0o600` / `0o700` / `0o644` / `0o711`. Windows has none: `statSync().mode` never
 // carries them, so a raw mode assertion there can never pass. File privacy on Windows comes from the
 // ACL of the profile directory the data folder lives in, not from a per-file mode
-// (odd/tasks/windows-port.md). These helpers skip the mode assertion on Windows, but say so once per
-// test process so a green Windows run cannot quietly assert nothing.
+// (odd/tasks/windows-port.md). These helpers skip the mode assertion on Windows, but say so on
+// every gated assertion, so a green Windows run cannot quietly assert nothing: each skipped
+// assertion stays visible in its own test's report.
 import { lstatSync, statSync } from "node:fs";
 import { expect } from "vitest";
 
@@ -13,11 +14,7 @@ export function hasPosixModes(platform: string = process.platform): boolean {
 	return platform !== "win32";
 }
 
-let warned = false;
-
 function warnSkipped(): void {
-	if (warned) return;
-	warned = true;
 	console.warn(
 		"posix-modes: Windows has no POSIX mode bits, so file and directory mode assertions are skipped; " +
 			"privacy relies on the ACL of the profile directory (see odd/tasks/windows-port.md).",
