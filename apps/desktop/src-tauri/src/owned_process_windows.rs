@@ -194,11 +194,35 @@ impl StdioPipes {
     }
 }
 
-// Narrow, unwind-safe exposure window. This is NOT process-wide spawn
-// serialization: unrelated unrestricted spawns can still race this window.
+// Defense-in-depth for cooperating launchers only. Every future Windows launcher
+// must acquire this same lock through its process creation. Arbitrary unrelated
+// launches that do not cooperate can still inherit temporarily enabled handles.
+static WINDOWS_SPAWN_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+// Narrow, unwind-safe exposure window.
+#[cfg(test)]
+thread_local! {
+    // Thread-local so parallel tests cannot intercept another spawn attempt.
+    static STDIO_RACE_PROBE: std::cell::RefCell<Option<Box<dyn FnMut(HANDLE, [HANDLE; 2])>>> =
+        std::cell::RefCell::new(None);
+}
+
+#[cfg(test)]
+fn stdio_race_probe(process: HANDLE, handles: Option<[HANDLE; 2]>) {
+    if let Some(handles) = handles {
+        STDIO_RACE_PROBE.with(|probe| {
+            if let Some(probe) = probe.borrow_mut().as_mut() {
+                probe(process, handles);
+            }
+        });
+    }
+}
+
 struct InheritanceWindow<'a> {
     handles: &'a [HANDLE; 2],
     active: bool,
+    // Drop releases serialization only after Drop has restored inheritance flags.
+    _spawn_guard: std::sync::MutexGuard<'static, ()>,
 }
 impl<'a> InheritanceWindow<'a> {
     fn enable(handles: &'a [HANDLE; 2]) -> io::Result<Self> {
@@ -206,6 +230,11 @@ impl<'a> InheritanceWindow<'a> {
         let window = Self {
             handles,
             active: true,
+            // Unwinding clears flags before releasing the lock, so a poisoned
+            // lock can safely be recovered for subsequent cooperating launches.
+            _spawn_guard: WINDOWS_SPAWN_LOCK
+                .lock()
+                .unwrap_or_else(|error| error.into_inner()),
         };
         for &handle in handles {
             if unsafe { SetHandleInformation(handle, HANDLE_FLAG_INHERIT, HANDLE_FLAG_INHERIT) }
@@ -438,6 +467,8 @@ impl OwnedProcess {
         // SAFETY: buffers and attribute storage/value remain live through spawn.
         // HANDLE_LIST restricts TRUE inheritance to precisely the two endpoints;
         // the no-handoff path retains FALSE, original flags and STARTUPINFOW.
+        #[cfg(test)]
+        stdio_race_probe(std::ptr::null_mut(), handles);
         let created = unsafe {
             CreateProcessW(
                 application.as_ptr(),
@@ -476,6 +507,8 @@ impl OwnedProcess {
             thread: Handle(information.hThread),
             job: None,
         };
+        #[cfg(test)]
+        stdio_race_probe(information.hProcess, handles);
         if let Some(window) = window {
             window.clear()?;
         }
@@ -821,6 +854,255 @@ mod native_tests {
         let partial = [handles[0], std::ptr::null_mut()];
         assert!(InheritanceWindow::enable(&partial).is_err());
         assert_eq!(flags(handles[0]), 0);
+    }
+
+    #[test]
+    #[ignore = "known non-cooperating inheritance gap; prerequisite before real Windows daemon orchestration wiring (currently Unsupported)"]
+    fn windows_owned_stdio_unrelated_concurrent_launch() {
+        use std::io::{Read, Write};
+        use std::os::windows::io::AsRawHandle;
+        use std::os::windows::process::CommandExt;
+        use windows_sys::Win32::Foundation::{
+            CompareObjectHandles, GetHandleInformation, HANDLE_FLAG_INHERIT,
+        };
+        use windows_sys::Win32::Security::SECURITY_ATTRIBUTES;
+        use windows_sys::Win32::System::Threading::CreateEventW;
+
+        fn has_object(process: HANDLE, handle: HANDLE) -> bool {
+            let mut copied = std::ptr::null_mut();
+            if unsafe {
+                DuplicateHandle(
+                    process,
+                    handle,
+                    GetCurrentProcess(),
+                    &mut copied,
+                    0,
+                    0,
+                    DUPLICATE_SAME_ACCESS,
+                )
+            } == 0
+            {
+                assert_eq!(io::Error::last_os_error().raw_os_error(), Some(6));
+                return false;
+            }
+            let copied = Handle(copied);
+            unsafe { CompareObjectHandles(copied.0, handle) != 0 }
+        }
+        struct ResetProbe;
+        impl Drop for ResetProbe {
+            fn drop(&mut self) {
+                STDIO_RACE_PROBE.with(|probe| *probe.borrow_mut() = None);
+            }
+        }
+        let _reset = ResetProbe;
+        let security = SECURITY_ATTRIBUTES {
+            nLength: size_of::<SECURITY_ATTRIBUTES>() as u32,
+            lpSecurityDescriptor: std::ptr::null_mut(),
+            bInheritHandle: 1,
+        };
+        let excluded = Handle(unsafe { CreateEventW(&security, 1, 0, null()) });
+        assert!(!excluded.0.is_null());
+        let excluded_value = excluded.0 as usize;
+        STDIO_RACE_PROBE.with(|probe| {
+            *probe.borrow_mut() = Some(Box::new(move |process, handles| {
+                let excluded = excluded_value as HANDLE;
+                if !process.is_null() {
+                    // The intended child is still suspended and parent child-end
+                    // copies are live: compare identity, not just numeric presence.
+                    for handle in handles {
+                        assert!(has_object(process, handle));
+                    }
+                    assert!(!has_object(process, excluded));
+                    return;
+                }
+                for handle in handles {
+                    let mut flags = 0;
+                    assert_ne!(unsafe { GetHandleInformation(handle, &mut flags) }, 0);
+                    assert_ne!(flags & HANDLE_FLAG_INHERIT, 0);
+                }
+                // The owning thread stays inside the enabled window until the
+                // separate ordinary Command launcher completes its real OS spawn.
+                // Suspended helpers prevent runtime handle reuse and need no IPC.
+                let (send, receive) = std::sync::mpsc::sync_channel(1);
+                let launcher = std::thread::spawn(move || {
+                    let (exe, args, _) = fixture("exit");
+                    let child = std::process::Command::new(exe)
+                        .args(args)
+                        .env_clear()
+                        .env("OWNED_PROCESS_TEST_ROLE", "exit")
+                        .creation_flags(CREATE_SUSPENDED)
+                        .spawn()
+                        .unwrap();
+                    if let Err(error) = send.send(child) {
+                        let mut child = error.0;
+                        child.kill().unwrap();
+                        child.wait().unwrap();
+                    }
+                });
+                let mut helper = receive.recv_timeout(Duration::from_secs(10)).unwrap();
+                launcher.join().unwrap();
+                let leaked = handles.map(|handle| has_object(helper.as_raw_handle(), handle));
+                helper.kill().unwrap();
+                helper.wait().unwrap();
+
+                // Positive control: unrestricted native TRUE inheritance must
+                // deliver both exact objects, validating the same identity probe.
+                let (exe, args, env) = fixture("exit");
+                let application: Vec<u16> = exe.encode_wide().chain(Some(0)).collect();
+                let mut command = command_line(&exe, &args).unwrap();
+                let block = environment(&env).unwrap();
+                let startup = STARTUPINFOW {
+                    cb: size_of::<STARTUPINFOW>() as u32,
+                    ..Default::default()
+                };
+                let mut information = PROCESS_INFORMATION::default();
+                assert_ne!(
+                    unsafe {
+                        CreateProcessW(
+                            application.as_ptr(),
+                            command.as_mut_ptr(),
+                            null(),
+                            null(),
+                            1,
+                            CREATE_SUSPENDED | CREATE_UNICODE_ENVIRONMENT,
+                            block.as_ptr().cast(),
+                            null(),
+                            &startup,
+                            &mut information,
+                        )
+                    },
+                    0
+                );
+                let _control = PendingProcess {
+                    process: Some(Handle(information.hProcess)),
+                    thread: Handle(information.hThread),
+                    job: None,
+                };
+                for handle in handles {
+                    assert!(
+                        has_object(information.hProcess, handle),
+                        "positive control missed pipe"
+                    );
+                }
+                assert_eq!(
+                    leaked,
+                    [false, false],
+                    "unrelated Command inherited child pipes"
+                );
+            }));
+        });
+        let (exe, args, env) = fixture("channel");
+        let (child, mut parent) = OwnedProcess::spawn_with_stdio(&exe, &args, &env).unwrap();
+        parent.stdin.write_all(b"marker").unwrap();
+        drop(parent.stdin);
+        assert_eq!(child.wait(10_000).unwrap(), Some(37));
+        let mut output = Vec::new();
+        parent.stdout.take(4096).read_to_end(&mut output).unwrap();
+        assert!(output.ends_with(b"marker"), "{output:?}");
+        // A pass confirms only this ordinary Command scenario in this tested live
+        // window, not universal safety against arbitrary unrestricted launchers.
+    }
+
+    #[test]
+    fn windows_owned_stdio_cooperative_launch() {
+        use std::io::{Read, Write};
+        use std::os::windows::io::AsRawHandle;
+        use std::os::windows::process::CommandExt;
+        use windows_sys::Win32::Foundation::CompareObjectHandles;
+        let (attempted_send, attempted_receive) = std::sync::mpsc::sync_channel(1);
+        let (finished_send, finished_receive) = std::sync::mpsc::sync_channel(1);
+        struct ResetProbe;
+        impl Drop for ResetProbe {
+            fn drop(&mut self) {
+                STDIO_RACE_PROBE.with(|probe| *probe.borrow_mut() = None);
+            }
+        }
+        let _reset = ResetProbe;
+        let mut sender = Some((attempted_send, finished_send));
+        STDIO_RACE_PROBE.with(|probe| {
+            *probe.borrow_mut() = Some(Box::new(move |process, handles| {
+                if !process.is_null() {
+                    return;
+                }
+                let (attempted, finished) = sender.take().unwrap();
+                // Retain non-inheritable identity references after spawn closes
+                // its original child ends. Transfer sole ownership to the worker.
+                let references = handles.map(|handle| {
+                    let reference = std::mem::ManuallyDrop::new(duplicate(handle));
+                    (handle as usize, reference.0 as usize)
+                });
+                std::thread::spawn(move || {
+                    let references = references
+                        .map(|(value, reference)| (value as HANDLE, Handle(reference as HANDLE)));
+                    let blocked = matches!(
+                        WINDOWS_SPAWN_LOCK.try_lock(),
+                        Err(std::sync::TryLockError::WouldBlock)
+                    );
+                    attempted.send(blocked).unwrap();
+                    if !blocked {
+                        return;
+                    }
+                    let _guard = WINDOWS_SPAWN_LOCK
+                        .lock()
+                        .unwrap_or_else(|error| error.into_inner());
+                    let (exe, args, _) = fixture("exit");
+                    let mut helper = std::process::Command::new(exe)
+                        .args(args)
+                        .env_clear()
+                        .env("OWNED_PROCESS_TEST_ROLE", "exit")
+                        .creation_flags(CREATE_SUSPENDED)
+                        .spawn()
+                        .unwrap();
+                    let leaked = references.map(|(value, reference)| {
+                        let mut copied = std::ptr::null_mut();
+                        if unsafe {
+                            DuplicateHandle(
+                                helper.as_raw_handle(),
+                                value,
+                                GetCurrentProcess(),
+                                &mut copied,
+                                0,
+                                0,
+                                DUPLICATE_SAME_ACCESS,
+                            )
+                        } == 0
+                        {
+                            assert_eq!(io::Error::last_os_error().raw_os_error(), Some(6));
+                            return false;
+                        }
+                        let copied = Handle(copied);
+                        unsafe { CompareObjectHandles(copied.0, reference.0) != 0 }
+                    });
+                    helper.kill().unwrap();
+                    let waited = unsafe { WaitForSingleObject(helper.as_raw_handle(), 10_000) };
+                    assert_eq!(waited, WAIT_OBJECT_0);
+                    helper.wait().unwrap();
+                    finished.send((leaked, waited)).unwrap();
+                });
+                assert!(
+                    attempted_receive
+                        .recv_timeout(Duration::from_secs(10))
+                        .unwrap(),
+                    "cooperating launcher acquired lock inside inheritance window"
+                );
+                // No sleeps: try_lock proved exclusion on the worker thread;
+                // returning lets the owned launch clear flags and release the lock.
+            }));
+        });
+        let (exe, args, env) = fixture("channel");
+        let (child, mut parent) = OwnedProcess::spawn_with_stdio(&exe, &args, &env).unwrap();
+        let (leaked, waited) = finished_receive
+            .recv_timeout(Duration::from_secs(20))
+            .unwrap();
+        assert_eq!(leaked, [false, false]);
+        assert_eq!(waited, WAIT_OBJECT_0);
+        parent.stdin.write_all(b"marker").unwrap();
+        drop(parent.stdin);
+        assert_eq!(child.wait(10_000).unwrap(), Some(37));
+        let mut output = Vec::new();
+        parent.stdout.take(4096).read_to_end(&mut output).unwrap();
+        assert!(output.ends_with(b"marker"), "{output:?}");
+        // This proves cooperating serialization, not safety for arbitrary launchers.
     }
 
     #[test]
