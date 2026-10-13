@@ -383,7 +383,7 @@ enum Stage {
     Assigned,
 }
 
-#[allow(dead_code)] // Not yet connected to the public daemon facade.
+#[cfg_attr(not(test), allow(dead_code))] // Production facade wiring is a later unit.
 impl OwnedProcess {
     pub(super) fn retained_identity(&self) -> io::Result<RetainedIdentity> {
         use std::os::windows::io::BorrowedHandle;

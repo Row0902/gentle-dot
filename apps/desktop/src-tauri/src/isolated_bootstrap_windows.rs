@@ -1,6 +1,7 @@
-//! Restricted endpoint creation and private, unauthenticated connection ownership.
+//! Restricted endpoint creation and retained-process peer identity matching.
 #![allow(dead_code)] // Not wired into production until the later bootstrap units.
 
+use super::owned_process_windows::RetainedIdentity;
 use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
 use std::time::{Duration, Instant};
 use std::{io, ptr};
@@ -164,6 +165,32 @@ impl ServerEndpoint {
         }
     }
 
+    fn accept_owned(
+        self,
+        identity: RetainedIdentity,
+        deadline: Instant,
+    ) -> io::Result<VerifiedEndpoint> {
+        identity.live_pid()?;
+        let Self { handle, name: _ } = self;
+        let raw = handle.0;
+        std::mem::forget(handle);
+        let pipe = unsafe { OwnedHandle::from_raw_handle(raw) };
+        let (sender, receiver) = std::sync::mpsc::channel();
+        std::thread::Builder::new()
+            .name("bootstrap-authorize".into())
+            .spawn(move || {
+                let result = authorize_operation(pipe, &identity, deadline);
+                let _ = sender.send(result);
+            })?;
+        let result = receiver
+            .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+            .map_err(|_| timed_out())?;
+        if Instant::now() >= deadline {
+            return Err(timed_out());
+        }
+        result
+    }
+
     fn connect_unverified(self, deadline: Instant) -> io::Result<UnverifiedEndpoint> {
         if Instant::now() >= deadline {
             return Err(timed_out());
@@ -178,7 +205,7 @@ impl ServerEndpoint {
         std::thread::Builder::new()
             .name("bootstrap-connect".into())
             .spawn(move || {
-                let result = connect_operation(pipe, deadline);
+                let result = connect_operation(pipe, deadline, None);
                 // Failed delivery drops the private endpoint, including a late result.
                 let _ = sender.send(result);
             })?;
@@ -212,7 +239,44 @@ fn timed_out() -> io::Error {
     io::Error::new(io::ErrorKind::TimedOut, "bootstrap connection deadline")
 }
 
-fn connect_operation(pipe: OwnedHandle, deadline: Instant) -> io::Result<UnverifiedEndpoint> {
+// Matches the retained live OS process, not a secret or compromise-resistant authentication.
+// Deliberately exposes no protocol or read/write operations.
+struct VerifiedEndpoint {
+    _endpoint: UnverifiedEndpoint,
+}
+
+fn authorize_operation(
+    mut pipe: OwnedHandle,
+    identity: &RetainedIdentity,
+    deadline: Instant,
+) -> io::Result<VerifiedEndpoint> {
+    loop {
+        identity.live_pid()?;
+        if Instant::now() >= deadline {
+            return Err(timed_out());
+        }
+        let endpoint = connect_operation(pipe, deadline, Some(identity))?;
+        let mut client_pid = 0;
+        checked(unsafe {
+            GetNamedPipeClientProcessId(endpoint.pipe.as_raw_handle(), &mut client_pid)
+        })?;
+        if client_pid == identity.live_pid()? {
+            return Ok(VerifiedEndpoint {
+                _endpoint: endpoint,
+            });
+        }
+        // Retain a duplicate for the next accept; dropping the rejected endpoint
+        // disconnects the same pipe instance before that accept begins.
+        pipe = endpoint.pipe.try_clone()?;
+        drop(endpoint);
+    }
+}
+
+fn connect_operation(
+    pipe: OwnedHandle,
+    deadline: Instant,
+    identity: Option<&RetainedIdentity>,
+) -> io::Result<UnverifiedEndpoint> {
     let event = unsafe { CreateEventW(ptr::null(), 1, 0, ptr::null()) };
     if event.is_null() {
         return Err(io::Error::last_os_error());
@@ -228,7 +292,10 @@ fn connect_operation(pipe: OwnedHandle, deadline: Instant) -> io::Result<Unverif
             ERROR_IO_PENDING => {
                 loop {
                     let remaining = deadline.saturating_duration_since(Instant::now());
-                    if remaining.is_zero() {
+                    let failure = identity
+                        .and_then(|identity| identity.live_pid().err())
+                        .or_else(|| remaining.is_zero().then(timed_out));
+                    if let Some(error) = failure {
                         // CancelIoEx requests cancellation; it does NOT settle it.
                         // This worker keeps stack OVERLAPPED, event, and pipe alive
                         // until GetOverlappedResult actually reports completion.
@@ -239,7 +306,7 @@ fn connect_operation(pipe: OwnedHandle, deadline: Instant) -> io::Result<Unverif
                         unsafe {
                             GetOverlappedResult(raw, &operation, &mut transferred, 1);
                         }
-                        return Err(timed_out());
+                        return Err(error);
                     }
                     let millis = remaining.min(Duration::from_millis(10)).as_millis().max(1) as u32;
                     match unsafe { WaitForSingleObject(event.as_raw_handle(), millis) } {
@@ -278,6 +345,128 @@ fn connect_operation(pipe: OwnedHandle, deadline: Instant) -> io::Result<Unverif
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn peer(role: &str, name: &str) -> super::super::owned_process_windows::OwnedProcess {
+        use std::ffi::OsString;
+        super::super::owned_process_windows::OwnedProcess::spawn(
+            std::env::current_exe().unwrap().as_os_str(),
+            &[
+                OsString::from("--exact"),
+                OsString::from("isolated_bootstrap_windows::tests::windows_bootstrap_peer_fixture"),
+            ],
+            &[
+                ("BOOTSTRAP_ROLE".into(), role.into()),
+                ("BOOTSTRAP_PIPE".into(), name.into()),
+            ],
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn windows_bootstrap_peer_fixture() {
+        let Ok(role) = std::env::var("BOOTSTRAP_ROLE") else {
+            return;
+        };
+        if role == "exit" {
+            return;
+        }
+        if role == "waiting-exit" {
+            std::thread::sleep(Duration::from_millis(200));
+            return;
+        }
+        let name = wide(&std::env::var("BOOTSTRAP_PIPE").unwrap());
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let handle = unsafe {
+                CreateFileW(
+                    name.as_ptr(),
+                    CLIENT_RIGHTS,
+                    0,
+                    ptr::null(),
+                    OPEN_EXISTING,
+                    0,
+                    ptr::null_mut(),
+                )
+            };
+            if handle != INVALID_HANDLE_VALUE {
+                let _handle = Handle(handle);
+                std::thread::sleep(Duration::from_secs(5));
+                return;
+            }
+            assert!(Instant::now() < deadline, "{}", io::Error::last_os_error());
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    #[test]
+    fn windows_bootstrap_owned_correct() {
+        let server = ServerEndpoint::create().unwrap();
+        let process = peer("connect", &server.name);
+        assert!(server
+            .accept_owned(
+                process.retained_identity().unwrap(),
+                Instant::now() + Duration::from_secs(5)
+            )
+            .is_ok());
+    }
+
+    #[test]
+    fn windows_bootstrap_owned_wrong_first() {
+        let server = ServerEndpoint::create().unwrap();
+        let wrong = peer("connect", &server.name);
+        // Observe the connected PID before starting the owned client: no ordering sleep.
+        let start = Instant::now();
+        loop {
+            let mut pid = 0;
+            if unsafe { GetNamedPipeClientProcessId(server.handle.0, &mut pid) } != 0 {
+                assert_eq!(pid, wrong.retained_identity().unwrap().live_pid().unwrap());
+                break;
+            }
+            assert!(start.elapsed() < Duration::from_secs(5));
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let process = peer("connect", &server.name);
+        assert!(server
+            .accept_owned(
+                process.retained_identity().unwrap(),
+                start + Duration::from_secs(5)
+            )
+            .is_ok());
+    }
+
+    #[test]
+    fn windows_bootstrap_owned_dead() {
+        let server = ServerEndpoint::create().unwrap();
+        let process = peer("exit", &server.name);
+        assert!(process.wait(5000).unwrap().is_some());
+        let start = Instant::now();
+        let error = server
+            .accept_owned(
+                process.retained_identity().unwrap(),
+                start + Duration::from_secs(5),
+            )
+            .err()
+            .unwrap();
+        assert_eq!(error.kind(), io::ErrorKind::BrokenPipe);
+        assert_eq!(error.to_string(), "owned peer exited");
+        assert!(start.elapsed() < Duration::from_secs(2));
+    }
+
+    #[test]
+    fn windows_bootstrap_owned_waiting_exit() {
+        let server = ServerEndpoint::create().unwrap();
+        let process = peer("waiting-exit", &server.name);
+        let identity = process.retained_identity().unwrap();
+        identity.live_pid().unwrap();
+        let start = Instant::now();
+        let error = server
+            .accept_owned(identity, start + Duration::from_secs(5))
+            .err()
+            .unwrap();
+        assert_eq!(error.kind(), io::ErrorKind::BrokenPipe);
+        assert_eq!(error.to_string(), "owned peer exited");
+        assert!(start.elapsed() < Duration::from_secs(2));
+    }
 
     #[test]
     fn windows_bootstrap_connection_zero_deadline() {
