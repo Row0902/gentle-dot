@@ -352,6 +352,30 @@ pub(super) struct OwnedProcess {
     stopped: bool,
 }
 
+// A duplicated retained handle preserves identity without reopening a PID.
+pub(super) struct RetainedIdentity(std::os::windows::io::OwnedHandle);
+impl RetainedIdentity {
+    pub(super) fn live_pid(&self) -> io::Result<u32> {
+        use std::os::windows::io::AsRawHandle;
+        let handle = self.0.as_raw_handle();
+        match unsafe { WaitForSingleObject(handle, 0) } {
+            WAIT_TIMEOUT => {
+                let pid = unsafe { windows_sys::Win32::System::Threading::GetProcessId(handle) };
+                if pid == 0 {
+                    Err(io::Error::last_os_error())
+                } else {
+                    Ok(pid)
+                }
+            }
+            WAIT_OBJECT_0 => Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "owned peer exited",
+            )),
+            _ => Err(io::Error::last_os_error()),
+        }
+    }
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Stage {
     Created,
@@ -361,6 +385,12 @@ enum Stage {
 
 #[allow(dead_code)] // Not yet connected to the public daemon facade.
 impl OwnedProcess {
+    pub(super) fn retained_identity(&self) -> io::Result<RetainedIdentity> {
+        use std::os::windows::io::BorrowedHandle;
+        let borrowed = unsafe { BorrowedHandle::borrow_raw(self.process.0) };
+        Ok(RetainedIdentity(borrowed.try_clone_to_owned()?))
+    }
+
     pub(super) fn spawn(
         executable: &OsStr,
         arguments: &[OsString],

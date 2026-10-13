@@ -1,7 +1,10 @@
-//! Creation only: no connection, pending I/O, process launch, or peer authentication.
+//! Restricted endpoint creation and private, unauthenticated connection ownership.
 #![allow(dead_code)] // Not wired into production until the later bootstrap units.
 
+use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
+use std::time::{Duration, Instant};
 use std::{io, ptr};
+use windows_sys::Win32::System::IO::{CancelIoEx, GetOverlappedResult, OVERLAPPED};
 use windows_sys::Win32::{
     Foundation::*,
     Security::{Authorization::*, *},
@@ -10,7 +13,8 @@ use windows_sys::Win32::{
 };
 
 const PREFIX: &str = r"\\.\pipe\gentle-dot-";
-const CLIENT_RIGHTS: u32 = FILE_READ_DATA | FILE_WRITE_DATA | SYNCHRONIZE;
+// Client opens require FILE_READ_ATTRIBUTES against this restrictive DACL.
+const CLIENT_RIGHTS: u32 = FILE_READ_DATA | FILE_WRITE_DATA | FILE_READ_ATTRIBUTES | SYNCHRONIZE;
 const OPEN_MODE: u32 = PIPE_ACCESS_DUPLEX | FILE_FLAG_FIRST_PIPE_INSTANCE | FILE_FLAG_OVERLAPPED;
 const PIPE_MODE: u32 = PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT | PIPE_REJECT_REMOTE_CLIENTS;
 
@@ -160,15 +164,170 @@ impl ServerEndpoint {
         }
     }
 
+    fn connect_unverified(self, deadline: Instant) -> io::Result<UnverifiedEndpoint> {
+        if Instant::now() >= deadline {
+            return Err(timed_out());
+        }
+        // Transfer only a safe owned handle, not the raw-pointer wrapper, to one
+        // operation owner. The caller never joins cancellation cleanup.
+        let Self { handle, name: _ } = self;
+        let raw = handle.0;
+        std::mem::forget(handle);
+        let pipe = unsafe { OwnedHandle::from_raw_handle(raw) };
+        let (sender, receiver) = std::sync::mpsc::channel();
+        std::thread::Builder::new()
+            .name("bootstrap-connect".into())
+            .spawn(move || {
+                let result = connect_operation(pipe, deadline);
+                // Failed delivery drops the private endpoint, including a late result.
+                let _ = sender.send(result);
+            })?;
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        let result = receiver.recv_timeout(remaining).map_err(|_| timed_out())?;
+        if Instant::now() >= deadline {
+            return Err(timed_out());
+        }
+        result
+    }
+
     #[cfg(test)]
     fn same_name_for_test(name: &str) -> io::Result<Self> {
         Self::create_named(name.to_owned())
     }
 }
 
+// No channel operations or handle accessor: connection is not authorization.
+struct UnverifiedEndpoint {
+    pipe: OwnedHandle,
+}
+impl Drop for UnverifiedEndpoint {
+    fn drop(&mut self) {
+        unsafe {
+            DisconnectNamedPipe(self.pipe.as_raw_handle());
+        }
+    }
+}
+
+fn timed_out() -> io::Error {
+    io::Error::new(io::ErrorKind::TimedOut, "bootstrap connection deadline")
+}
+
+fn connect_operation(pipe: OwnedHandle, deadline: Instant) -> io::Result<UnverifiedEndpoint> {
+    let event = unsafe { CreateEventW(ptr::null(), 1, 0, ptr::null()) };
+    if event.is_null() {
+        return Err(io::Error::last_os_error());
+    }
+    let event = unsafe { OwnedHandle::from_raw_handle(event) };
+    let mut operation: OVERLAPPED = unsafe { std::mem::zeroed() };
+    operation.hEvent = event.as_raw_handle();
+    let raw = pipe.as_raw_handle();
+    let connected = unsafe { ConnectNamedPipe(raw, &mut operation) };
+    if connected == 0 {
+        match unsafe { GetLastError() } {
+            ERROR_PIPE_CONNECTED => {}
+            ERROR_IO_PENDING => {
+                loop {
+                    let remaining = deadline.saturating_duration_since(Instant::now());
+                    if remaining.is_zero() {
+                        // CancelIoEx requests cancellation; it does NOT settle it.
+                        // This worker keeps stack OVERLAPPED, event, and pipe alive
+                        // until GetOverlappedResult actually reports completion.
+                        unsafe {
+                            CancelIoEx(raw, &operation);
+                        }
+                        let mut transferred = 0;
+                        unsafe {
+                            GetOverlappedResult(raw, &operation, &mut transferred, 1);
+                        }
+                        return Err(timed_out());
+                    }
+                    let millis = remaining.min(Duration::from_millis(10)).as_millis().max(1) as u32;
+                    match unsafe { WaitForSingleObject(event.as_raw_handle(), millis) } {
+                        WAIT_OBJECT_0 => {
+                            let mut transferred = 0;
+                            checked(unsafe {
+                                GetOverlappedResult(raw, &operation, &mut transferred, 1)
+                            })?;
+                            break;
+                        }
+                        WAIT_TIMEOUT => {}
+                        _ => {
+                            let error = io::Error::last_os_error();
+                            unsafe {
+                                CancelIoEx(raw, &operation);
+                            }
+                            let mut transferred = 0;
+                            unsafe {
+                                GetOverlappedResult(raw, &operation, &mut transferred, 1);
+                            }
+                            return Err(error);
+                        }
+                    }
+                }
+            }
+            _ => return Err(io::Error::last_os_error()),
+        }
+    }
+    let endpoint = UnverifiedEndpoint { pipe };
+    if Instant::now() >= deadline {
+        return Err(timed_out());
+    }
+    Ok(endpoint)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn windows_bootstrap_connection_zero_deadline() {
+        let endpoint = ServerEndpoint::create().unwrap();
+        let error = endpoint
+            .connect_unverified(std::time::Instant::now())
+            .err()
+            .unwrap();
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+    }
+
+    #[test]
+    fn windows_bootstrap_connection_pending_timeout() {
+        let endpoint = ServerEndpoint::create().unwrap();
+        let start = std::time::Instant::now();
+        let error = endpoint
+            .connect_unverified(start + std::time::Duration::from_millis(100))
+            .err()
+            .unwrap();
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+        assert!(start.elapsed() < std::time::Duration::from_secs(5));
+    }
+
+    #[test]
+    fn windows_bootstrap_connection_early_client() {
+        let endpoint = ServerEndpoint::create().unwrap();
+        let name = wide(&endpoint.name);
+        // Connection-only fixture: no data rights and no protocol bytes.
+        let client = unsafe {
+            CreateFileW(
+                name.as_ptr(),
+                0,
+                0,
+                ptr::null(),
+                OPEN_EXISTING,
+                FILE_FLAG_OVERLAPPED,
+                ptr::null_mut(),
+            )
+        };
+        assert_ne!(
+            client,
+            INVALID_HANDLE_VALUE,
+            "{}",
+            io::Error::last_os_error()
+        );
+        let _client = Handle(client);
+        assert!(endpoint
+            .connect_unverified(std::time::Instant::now() + std::time::Duration::from_secs(5))
+            .is_ok());
+    }
 
     #[test]
     fn windows_bootstrap_endpoint_missing_logon_sid_fails_closed() {
