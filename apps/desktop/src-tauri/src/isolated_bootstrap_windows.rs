@@ -256,10 +256,12 @@ impl VerifiedEndpoint {
             PipeReader(PipeDirection {
                 pipe: pipe.clone(),
                 event: reader_event,
+                state: Default::default(),
             }),
             PipeWriter(PipeDirection {
                 pipe,
                 event: writer_event,
+                state: Default::default(),
             }),
         ))
     }
@@ -273,41 +275,96 @@ fn direction_event() -> io::Result<OwnedHandle> {
     Ok(unsafe { OwnedHandle::from_raw_handle(event) })
 }
 
+#[derive(Default)]
+struct TransferState {
+    revoked: bool,
+    // Address of the boxed OVERLAPPED, valid only while protected by this mutex.
+    active: Option<usize>,
+}
+
+#[derive(Clone)]
+struct PipeCancellation {
+    pipe: std::sync::Arc<OwnedHandle>,
+    state: std::sync::Arc<std::sync::Mutex<TransferState>>,
+}
+
+impl PipeCancellation {
+    /// Permanently revokes this direction without waiting for I/O settlement.
+    fn cancel(&self) -> io::Result<()> {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.revoked = true;
+        if let Some(address) = state.active {
+            // The worker registers/submits and unregisters under the same mutex.
+            // It retains the operation, buffer and event through actual completion.
+            let result =
+                unsafe { CancelIoEx(self.pipe.as_raw_handle(), address as *const OVERLAPPED) };
+            if result == 0 {
+                let error = io::Error::last_os_error();
+                // Completion may have won the cancellation race.
+                if error.raw_os_error() != Some(ERROR_NOT_FOUND as i32) {
+                    return Err(error);
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
 struct PipeDirection {
     pipe: std::sync::Arc<OwnedHandle>,
     event: OwnedHandle,
+    state: std::sync::Arc<std::sync::Mutex<TransferState>>,
 }
 impl PipeDirection {
     fn transfer(&mut self, buffer: *mut u8, length: usize, read: bool) -> io::Result<usize> {
         if length == 0 {
             return Ok(0);
         }
-        let mut operation: OVERLAPPED = unsafe { std::mem::zeroed() };
+        let mut operation: Box<OVERLAPPED> = Box::new(unsafe { std::mem::zeroed() });
         operation.hEvent = self.event.as_raw_handle();
         let raw = self.pipe.as_raw_handle();
         let length = length.min(u32::MAX as usize) as u32;
-        // The single owning half serializes calls. Its buffer, event, and stack
-        // OVERLAPPED stay alive until completion, including pending operations.
+        // Serialize revocation with registration AND submission. Cancellation
+        // cannot miss a just-submitted operation or permit I/O after revocation.
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if state.revoked {
+            return Err(io::Error::from_raw_os_error(ERROR_OPERATION_ABORTED as i32));
+        }
+        state.active = Some((&mut *operation as *mut OVERLAPPED) as usize);
         let started = unsafe {
             if read {
-                ReadFile(raw, buffer, length, ptr::null_mut(), &mut operation)
+                ReadFile(raw, buffer, length, ptr::null_mut(), &mut *operation)
             } else {
-                WriteFile(raw, buffer, length, ptr::null_mut(), &mut operation)
+                WriteFile(raw, buffer, length, ptr::null_mut(), &mut *operation)
             }
         };
         if started == 0 {
             let error = io::Error::last_os_error();
             if error.raw_os_error() != Some(ERROR_IO_PENDING as i32) {
+                state.active = None;
                 if read && error.raw_os_error() == Some(ERROR_BROKEN_PIPE as i32) {
                     return Ok(0);
                 }
                 return Err(error);
             }
         }
+        drop(state);
+        // CancelIoEx merely requests cancellation. Keep all I/O storage alive
+        // until this wait settles, then unregister before destroying the box.
         let mut transferred = 0;
-        let completed = unsafe { GetOverlappedResult(raw, &operation, &mut transferred, 1) };
-        if completed == 0 {
-            let error = io::Error::last_os_error();
+        let completed = unsafe { GetOverlappedResult(raw, &*operation, &mut transferred, 1) };
+        let error = (completed == 0).then(io::Error::last_os_error);
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .active = None;
+        if let Some(error) = error {
             if read && error.raw_os_error() == Some(ERROR_BROKEN_PIPE as i32) {
                 return Ok(0);
             }
@@ -318,6 +375,14 @@ impl PipeDirection {
 }
 
 struct PipeReader(PipeDirection);
+impl PipeReader {
+    fn cancellation(&self) -> PipeCancellation {
+        PipeCancellation {
+            pipe: self.0.pipe.clone(),
+            state: self.0.state.clone(),
+        }
+    }
+}
 impl io::Read for PipeReader {
     fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
         self.0.transfer(buffer.as_mut_ptr(), buffer.len(), true)
@@ -325,6 +390,14 @@ impl io::Read for PipeReader {
 }
 
 struct PipeWriter(PipeDirection);
+impl PipeWriter {
+    fn cancellation(&self) -> PipeCancellation {
+        PipeCancellation {
+            pipe: self.0.pipe.clone(),
+            state: self.0.state.clone(),
+        }
+    }
+}
 impl io::Write for PipeWriter {
     fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
         self.0
@@ -542,6 +615,107 @@ mod tests {
                 Instant::now() + Duration::from_secs(5),
             )
             .is_ok());
+    }
+
+    fn duplex_peer(
+        role: &str,
+    ) -> (
+        super::super::owned_process_windows::OwnedProcess,
+        PipeReader,
+        PipeWriter,
+    ) {
+        let server = ServerEndpoint::create().unwrap();
+        let process = peer(role, &server.name);
+        let endpoint = server
+            .accept_owned(
+                process.retained_identity().unwrap(),
+                Instant::now() + Duration::from_secs(5),
+            )
+            .unwrap();
+        let (reader, writer) = endpoint.into_duplex().unwrap();
+        (process, reader, writer)
+    }
+
+    #[test]
+    fn windows_bootstrap_duplex_cancel_before_submission() {
+        use std::io::{Read, Write};
+        let (mut process, mut reader, mut writer) = duplex_peer("connect");
+        let read_cancel = reader.cancellation();
+        let write_cancel = writer.cancellation();
+        read_cancel.cancel().unwrap();
+        read_cancel.cancel().unwrap();
+        write_cancel.cancel().unwrap();
+        let read = reader.read(&mut [0; 1]);
+        let write = writer.write(b"not sent");
+        process.stop().unwrap();
+        assert_eq!(
+            read.unwrap_err().raw_os_error(),
+            Some(ERROR_OPERATION_ABORTED as i32)
+        );
+        assert_eq!(
+            write.unwrap_err().raw_os_error(),
+            Some(ERROR_OPERATION_ABORTED as i32)
+        );
+    }
+
+    fn wait_for_transfer(cancel: &PipeCancellation) {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while cancel.state.lock().unwrap().active.is_none() {
+            assert!(Instant::now() < deadline, "operation was not registered");
+            std::thread::yield_now();
+        }
+    }
+
+    #[test]
+    fn windows_bootstrap_duplex_cancel_pending_read_is_directional() {
+        use std::io::{Read, Write};
+        let (mut process, mut reader, mut writer) = duplex_peer("duplex");
+        let mut ready = [0; 5];
+        reader.read_exact(&mut ready).unwrap();
+        assert_eq!(&ready, b"ready");
+        let cancel = reader.cancellation();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            tx.send(reader.read(&mut [0; 4])).unwrap();
+        });
+        wait_for_transfer(&cancel);
+        let started = Instant::now();
+        cancel.cancel().unwrap();
+        assert!(started.elapsed() < Duration::from_secs(1));
+        let result = rx.recv_timeout(Duration::from_secs(2));
+        // The reader's cancellation must not revoke the writer on the same handle.
+        let write = writer.write_all(b"ping");
+        let exit = process.wait(2000).unwrap();
+        process.stop().unwrap();
+        worker.join().unwrap();
+        assert_eq!(
+            result.unwrap().unwrap_err().raw_os_error(),
+            Some(ERROR_OPERATION_ABORTED as i32)
+        );
+        write.unwrap();
+        assert_eq!(exit, Some(0));
+    }
+
+    #[test]
+    fn windows_bootstrap_duplex_cancel_pending_write() {
+        use std::io::Write;
+        let (mut process, _reader, mut writer) = duplex_peer("connect");
+        let cancel = writer.cancellation();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            tx.send(writer.write(&vec![0; 1024 * 1024])).unwrap();
+        });
+        wait_for_transfer(&cancel);
+        let started = Instant::now();
+        cancel.cancel().unwrap();
+        assert!(started.elapsed() < Duration::from_secs(1));
+        let result = rx.recv_timeout(Duration::from_secs(2));
+        process.stop().unwrap();
+        worker.join().unwrap();
+        assert_eq!(
+            result.unwrap().unwrap_err().raw_os_error(),
+            Some(ERROR_OPERATION_ABORTED as i32)
+        );
     }
 
     #[test]
