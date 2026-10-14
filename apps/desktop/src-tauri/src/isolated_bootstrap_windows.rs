@@ -240,9 +240,101 @@ fn timed_out() -> io::Error {
 }
 
 // Matches the retained live OS process, not a secret or compromise-resistant authentication.
-// Deliberately exposes no protocol or read/write operations.
 struct VerifiedEndpoint {
     _endpoint: UnverifiedEndpoint,
+}
+
+impl VerifiedEndpoint {
+    /// Transfers the pipe into independently signaled, sequential I/O halves.
+    fn into_duplex(self) -> io::Result<(PipeReader, PipeWriter)> {
+        let reader_event = direction_event()?;
+        let writer_event = direction_event()?;
+        // Suppress disconnect-on-drop while moving the sole owned pipe handle.
+        let endpoint = std::mem::ManuallyDrop::new(self._endpoint);
+        let pipe = std::sync::Arc::new(unsafe { ptr::read(&endpoint.pipe) });
+        Ok((
+            PipeReader(PipeDirection {
+                pipe: pipe.clone(),
+                event: reader_event,
+            }),
+            PipeWriter(PipeDirection {
+                pipe,
+                event: writer_event,
+            }),
+        ))
+    }
+}
+
+fn direction_event() -> io::Result<OwnedHandle> {
+    let event = unsafe { CreateEventW(ptr::null(), 1, 0, ptr::null()) };
+    if event.is_null() {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(unsafe { OwnedHandle::from_raw_handle(event) })
+}
+
+struct PipeDirection {
+    pipe: std::sync::Arc<OwnedHandle>,
+    event: OwnedHandle,
+}
+impl PipeDirection {
+    fn transfer(&mut self, buffer: *mut u8, length: usize, read: bool) -> io::Result<usize> {
+        if length == 0 {
+            return Ok(0);
+        }
+        let mut operation: OVERLAPPED = unsafe { std::mem::zeroed() };
+        operation.hEvent = self.event.as_raw_handle();
+        let raw = self.pipe.as_raw_handle();
+        let length = length.min(u32::MAX as usize) as u32;
+        // The single owning half serializes calls. Its buffer, event, and stack
+        // OVERLAPPED stay alive until completion, including pending operations.
+        let started = unsafe {
+            if read {
+                ReadFile(raw, buffer, length, ptr::null_mut(), &mut operation)
+            } else {
+                WriteFile(raw, buffer, length, ptr::null_mut(), &mut operation)
+            }
+        };
+        if started == 0 {
+            let error = io::Error::last_os_error();
+            if error.raw_os_error() != Some(ERROR_IO_PENDING as i32) {
+                if read && error.raw_os_error() == Some(ERROR_BROKEN_PIPE as i32) {
+                    return Ok(0);
+                }
+                return Err(error);
+            }
+        }
+        let mut transferred = 0;
+        let completed = unsafe { GetOverlappedResult(raw, &operation, &mut transferred, 1) };
+        if completed == 0 {
+            let error = io::Error::last_os_error();
+            if read && error.raw_os_error() == Some(ERROR_BROKEN_PIPE as i32) {
+                return Ok(0);
+            }
+            return Err(error);
+        }
+        Ok(transferred as usize)
+    }
+}
+
+struct PipeReader(PipeDirection);
+impl io::Read for PipeReader {
+    fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+        self.0.transfer(buffer.as_mut_ptr(), buffer.len(), true)
+    }
+}
+
+struct PipeWriter(PipeDirection);
+impl io::Write for PipeWriter {
+    fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+        self.0
+            .transfer(buffer.as_ptr().cast_mut(), buffer.len(), false)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        // Writes wait for completion; no userspace buffering remains to flush.
+        Ok(())
+    }
 }
 
 fn authorize_operation(
@@ -389,6 +481,16 @@ mod tests {
                 )
             };
             if handle != INVALID_HANDLE_VALUE {
+                if role == "duplex" {
+                    use std::io::{Read, Write};
+                    let mut file = unsafe { std::fs::File::from_raw_handle(handle) };
+                    file.write_all(b"ready").unwrap();
+                    let mut request = [0; 4];
+                    file.read_exact(&mut request).unwrap();
+                    assert_eq!(&request, b"ping");
+                    file.write_all(b"pong").unwrap();
+                    return;
+                }
                 let _handle = Handle(handle);
                 std::thread::sleep(Duration::from_secs(5));
                 return;
@@ -396,6 +498,77 @@ mod tests {
             assert!(Instant::now() < deadline, "{}", io::Error::last_os_error());
             std::thread::sleep(Duration::from_millis(10));
         }
+    }
+
+    #[test]
+    fn windows_bootstrap_owned_duplex_files() {
+        use std::io::{Read, Write};
+        let server = ServerEndpoint::create().unwrap();
+        let name = server.name.clone();
+        let process = peer("duplex", &name);
+        let endpoint = server
+            .accept_owned(
+                process.retained_identity().unwrap(),
+                Instant::now() + Duration::from_secs(5),
+            )
+            .unwrap();
+        let (mut reader, mut writer) = endpoint.into_duplex().unwrap();
+        let mut ready = [0; 5];
+        reader.read_exact(&mut ready).unwrap();
+        assert_eq!(&ready, b"ready");
+        let reading = std::thread::spawn(move || {
+            let mut response = [0; 4];
+            reader.read_exact(&mut response).unwrap();
+            assert_eq!(&response, b"pong");
+            reader
+        });
+        let writing = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(100));
+            writer.write_all(b"ping").unwrap();
+            writer
+        });
+        let reader = reading.join().unwrap();
+        let writer = writing.join().unwrap();
+        assert_eq!(process.wait(5000).unwrap(), Some(0));
+        drop(reader);
+        // The writer still owns the instance until both halves are dropped.
+        assert!(ServerEndpoint::same_name_for_test(&name).is_err());
+        drop(writer);
+        let replacement = ServerEndpoint::same_name_for_test(&name).unwrap();
+        let replacement_peer = peer("connect", &name);
+        assert!(replacement
+            .accept_owned(
+                replacement_peer.retained_identity().unwrap(),
+                Instant::now() + Duration::from_secs(5),
+            )
+            .is_ok());
+    }
+
+    #[test]
+    fn windows_bootstrap_owned_duplex_peer_close_eof() {
+        use std::io::{Read, Write};
+        let server = ServerEndpoint::create().unwrap();
+        let name = server.name.clone();
+        let process = peer("duplex", &name);
+        let endpoint = server
+            .accept_owned(
+                process.retained_identity().unwrap(),
+                Instant::now() + Duration::from_secs(5),
+            )
+            .unwrap();
+        let (mut reader, mut writer) = endpoint.into_duplex().unwrap();
+        let mut ready = [0; 5];
+        reader.read_exact(&mut ready).unwrap();
+        writer.write_all(b"ping").unwrap();
+        let mut response = [0; 4];
+        reader.read_exact(&mut response).unwrap();
+        assert_eq!(&response, b"pong");
+        assert_eq!(process.wait(5000).unwrap(), Some(0));
+        let mut buffer = [0; 8];
+        assert_eq!(reader.read(&mut buffer).unwrap(), 0);
+        assert_eq!(reader.read(&mut buffer).unwrap(), 0);
+        assert_eq!(writer.write(&[]).unwrap(), 0);
+        assert!(writer.write_all(b"late").is_err());
     }
 
     #[test]
