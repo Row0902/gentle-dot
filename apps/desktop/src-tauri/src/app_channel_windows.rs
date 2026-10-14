@@ -1,7 +1,8 @@
-//! Private Windows channel over the owned child's stdin/stdout. Possession of the
-//! pipe ends is the capability; there is no discoverable endpoint or token.
+//! Private Windows channel over owned stdio or verified named-pipe halves.
+//! Duplex endpoints are authorized against the retained child's process identity.
 
 use crate::approvals::ApprovalRequest;
+use crate::isolated_bootstrap_windows::{PipeCancellation, PipeReader, PipeWriter};
 use crate::owned_process_windows::ParentStdio;
 use crate::secure_store::{check_id, Secret, SecretStore};
 use serde::{Deserialize, Serialize};
@@ -99,18 +100,70 @@ struct Outgoing {
 }
 
 #[derive(Debug)]
+enum ChannelReader {
+    Stdio(File),
+    Duplex(PipeReader),
+}
+
+impl ChannelReader {
+    // None means an idle stdio pipe; Some(0) means duplex EOF.
+    fn receive(&mut self, buffer: &mut [u8]) -> io::Result<Option<usize>> {
+        match self {
+            Self::Duplex(reader) => reader.read(buffer).map(Some),
+            Self::Stdio(reader) => {
+                let mut available = 0;
+                // Only the owning reader thread consumes this live pipe.
+                if unsafe {
+                    PeekNamedPipe(
+                        reader.as_raw_handle(),
+                        std::ptr::null_mut(),
+                        0,
+                        std::ptr::null_mut(),
+                        &mut available,
+                        std::ptr::null_mut(),
+                    )
+                } == 0
+                {
+                    return Err(io::Error::last_os_error());
+                }
+                if available == 0 {
+                    return Ok(None);
+                }
+                let count = buffer.len().min(available as usize);
+                reader.read(&mut buffer[..count]).map(Some)
+            }
+        }
+    }
+}
+
+enum ChannelWriter {
+    Stdio(File),
+    Duplex(PipeWriter),
+}
+
+impl ChannelWriter {
+    fn write_all(&mut self, buffer: &[u8]) -> io::Result<()> {
+        match self {
+            Self::Stdio(writer) => writer.write_all(buffer),
+            Self::Duplex(writer) => writer.write_all(buffer),
+        }
+    }
+}
+
+#[derive(Debug)]
 pub struct AppChannel {
     outgoing: Mutex<VecDeque<Outgoing>>,
     wake_writer: Condvar,
-    reader: Mutex<Option<File>>,
+    reader: Mutex<Option<ChannelReader>>,
     writing_thread: Mutex<Option<u32>>,
+    duplex_cancellation: Mutex<Option<(PipeCancellation, PipeCancellation)>>,
     pending: Mutex<HashMap<u64, Reply>>,
     next: AtomicU64,
     open: AtomicBool,
 }
 
-// This synchronous-I/O API needs no OVERLAPPED storage. The locked dependency
-// does not enable Win32_System_IO; keep the single kernel32 binding local.
+// The legacy stdio path uses thread-scoped synchronous cancellation;
+// the duplex path instead targets its own registered OVERLAPPED operations.
 #[link(name = "kernel32")]
 extern "system" {
     fn CancelSynchronousIo(thread: windows_sys::Win32::Foundation::HANDLE) -> i32;
@@ -119,11 +172,41 @@ extern "system" {
 impl AppChannel {
     /// Starts the reader for pipe ends returned by the crate's owned process.
     pub(crate) fn start(pipes: ParentStdio, handler: Arc<dyn Handler>) -> io::Result<Arc<Self>> {
+        Self::start_transport(
+            ChannelReader::Stdio(pipes.stdout),
+            ChannelWriter::Stdio(pipes.stdin),
+            None,
+            handler,
+        )
+    }
+
+    /// Starts the channel on independently cancellable, verified duplex halves.
+    pub(crate) fn start_duplex(
+        reader: PipeReader,
+        writer: PipeWriter,
+        handler: Arc<dyn Handler>,
+    ) -> io::Result<Arc<Self>> {
+        let cancellation = (reader.cancellation(), writer.cancellation());
+        Self::start_transport(
+            ChannelReader::Duplex(reader),
+            ChannelWriter::Duplex(writer),
+            Some(cancellation),
+            handler,
+        )
+    }
+
+    fn start_transport(
+        reader: ChannelReader,
+        writer: ChannelWriter,
+        cancellation: Option<(PipeCancellation, PipeCancellation)>,
+        handler: Arc<dyn Handler>,
+    ) -> io::Result<Arc<Self>> {
         let channel = Arc::new(Self {
             outgoing: Mutex::new(VecDeque::new()),
             wake_writer: Condvar::new(),
-            reader: Mutex::new(Some(pipes.stdout)),
+            reader: Mutex::new(Some(reader)),
             writing_thread: Mutex::new(None),
+            duplex_cancellation: Mutex::new(cancellation),
             pending: Mutex::new(HashMap::new()),
             next: AtomicU64::new(0),
             open: AtomicBool::new(true),
@@ -131,7 +214,7 @@ impl AppChannel {
         let writing = channel.clone();
         std::thread::Builder::new()
             .name("app-channel-writer".into())
-            .spawn(move || writing.transmit(pipes.stdin))?;
+            .spawn(move || writing.transmit(writer))?;
         let reading = channel.clone();
         if let Err(error) = std::thread::Builder::new()
             .name("app-channel".into())
@@ -253,8 +336,19 @@ impl AppChannel {
             .unwrap_or_else(PoisonError::into_inner)
             .clear();
         self.wake_writer.notify_all();
-        // No writer lock, join, or cancellation-completion wait here. The reader
-        // closes stdout and retries cancellation after observing revocation.
+        // Take the revocation handles so a retained closed channel does not
+        // retain the pipe. Workers keep their I/O storage until settlement.
+        let cancellation = self
+            .duplex_cancellation
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take();
+        if let Some((reader, writer)) = cancellation {
+            let _ = reader.cancel();
+            let _ = writer.cancel();
+        }
+        // No reader lock, join or cancellation-completion wait on the caller.
+        // The stdio reader retries synchronous writer cancellation on shutdown.
         self.cancel_write();
     }
 
@@ -337,7 +431,8 @@ impl AppChannel {
         }
     }
 
-    fn transmit(self: Arc<Self>, mut writer: File) {
+    fn transmit(self: Arc<Self>, mut writer: ChannelWriter) {
+        let synchronous = matches!(&writer, ChannelWriter::Stdio(_));
         loop {
             let outgoing = {
                 let mut queue = self.outgoing.lock().unwrap_or_else(PoisonError::into_inner);
@@ -361,11 +456,13 @@ impl AppChannel {
                     continue;
                 }
                 *state = Transmission::Writing;
-                *self
-                    .writing_thread
-                    .lock()
-                    .unwrap_or_else(PoisonError::into_inner) =
-                    Some(unsafe { GetCurrentThreadId() });
+                if synchronous {
+                    *self
+                        .writing_thread
+                        .lock()
+                        .unwrap_or_else(PoisonError::into_inner) =
+                        Some(unsafe { GetCurrentThreadId() });
+                }
             }
             let result = if self.is_open() {
                 writer.write_all(&outgoing.line)
@@ -398,41 +495,20 @@ impl AppChannel {
     fn read(self: Arc<Self>, handler: Arc<dyn Handler>) {
         let mut line = Vec::new();
         let mut buffer = [0u8; 8192];
-        // Anonymous pipes support PeekNamedPipe. Read only available bytes, so
-        // close never waits behind a blocked stdout read. EOF is observed on a
-        // subsequent peek; polling does not promise an exact detection latency.
+        // Stdio retains peek-before-read polling. Duplex reads can block here:
+        // close uses the independent cancellation handle, never the reader lock.
         'reading: while self.is_open() {
             let result = {
                 let mut reader = self.reader.lock().unwrap_or_else(PoisonError::into_inner);
                 let Some(reader) = reader.as_mut() else {
                     break;
                 };
-                let mut available = 0;
-                // SAFETY: the locked File owns a live pipe handle. Only this
-                // thread reads it, so available bytes cannot be consumed elsewhere.
-                if unsafe {
-                    PeekNamedPipe(
-                        reader.as_raw_handle(),
-                        std::ptr::null_mut(),
-                        0,
-                        std::ptr::null_mut(),
-                        &mut available,
-                        std::ptr::null_mut(),
-                    )
-                } == 0
-                {
-                    Err(io::Error::last_os_error())
-                } else if available == 0 {
-                    Ok(0)
-                } else {
-                    let count = buffer.len().min(available as usize);
-                    reader.read(&mut buffer[..count])
-                }
+                reader.receive(&mut buffer)
             };
             match result {
-                Err(_) => break,
-                Ok(0) => std::thread::sleep(Duration::from_millis(5)),
-                Ok(count) => {
+                Err(_) | Ok(Some(0)) => break,
+                Ok(None) => std::thread::sleep(Duration::from_millis(5)),
+                Ok(Some(count)) => {
                     for &byte in &buffer[..count] {
                         line.push(byte);
                         if line.len() > MAX_FRAME + 1 {
@@ -570,6 +646,232 @@ mod tests {
     use super::*;
     use crate::owned_process_windows::OwnedProcess;
     use crate::secure_store::{MemoryStore, StoreError, MAX_ID_LEN};
+
+    fn duplex_peer(role: &str) -> (OwnedProcess, PipeReader, PipeWriter) {
+        use crate::isolated_bootstrap_windows::ServerEndpoint;
+        use std::ffi::OsString;
+        let server = ServerEndpoint::create().unwrap();
+        let process = OwnedProcess::spawn(
+            std::env::current_exe().unwrap().as_os_str(),
+            &[
+                OsString::from("--exact"),
+                OsString::from("app_channel::tests::windows_channel_duplex_fixture"),
+                OsString::from("--nocapture"),
+            ],
+            &[
+                (
+                    OsString::from("CHANNEL_PIPE"),
+                    OsString::from(server.name()),
+                ),
+                (OsString::from("CHANNEL_TEST_ROLE"), OsString::from(role)),
+            ],
+        )
+        .unwrap();
+        let endpoint = server
+            .accept_owned(
+                process.retained_identity().unwrap(),
+                Instant::now() + Duration::from_secs(5),
+            )
+            .unwrap();
+        let (reader, writer) = endpoint.into_duplex().unwrap();
+        (process, reader, writer)
+    }
+
+    fn duplex_fixture(role: &str) -> (OwnedProcess, Arc<AppChannel>, mpsc::Receiver<String>) {
+        let (process, reader, writer) = duplex_peer(role);
+        let (tx, rx) = mpsc::channel();
+        let channel = AppChannel::start_duplex(reader, writer, Arc::new(Approver(tx))).unwrap();
+        (process, channel, rx)
+    }
+
+    #[test]
+    fn windows_channel_duplex_fixture_accepts_both_approval_orders() {
+        use std::io::BufRead;
+        for request_first in [true, false] {
+            let (mut process, reader, mut writer) = duplex_peer("echo-approve");
+            let cancel = reader.cancellation();
+            let (tx, rx) = mpsc::channel();
+            let reading = std::thread::spawn(move || {
+                let mut reader = std::io::BufReader::new(reader);
+                let mut line = String::new();
+                reader.read_line(&mut line).unwrap();
+                tx.send(serde_json::from_str::<Value>(&line).unwrap())
+                    .unwrap();
+                line.clear();
+                reader.read_line(&mut line).unwrap();
+                tx.send(serde_json::from_str::<Value>(&line).unwrap())
+                    .unwrap();
+            });
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let approval = rx.recv_timeout(Duration::from_secs(3)).unwrap();
+                assert_eq!(approval["kind"], "request");
+                assert_eq!(approval["id"], 90);
+                let request = json!({"kind":"request","id":1,"method":"echo","params":{"value":7}});
+                let response = json!({"kind":"response","id":90,"result":{"approved":true}});
+                let frames = if request_first {
+                    [&request, &response]
+                } else {
+                    [&response, &request]
+                };
+                for frame in frames {
+                    writeln!(writer, "{frame}").unwrap();
+                }
+                rx.recv_timeout(Duration::from_secs(3))
+            }));
+            // Bound cleanup even when the child rejects the interleaving.
+            let _ = cancel.cancel();
+            let exit = process.wait(3000).unwrap();
+            process.stop().unwrap();
+            let joined = reading.join();
+            assert_eq!(
+                result.unwrap().unwrap(),
+                json!({"kind":"response","id":1,"result":{"value":7}})
+            );
+            assert_eq!(exit, Some(0));
+            joined.unwrap();
+        }
+    }
+
+    #[test]
+    fn windows_channel_duplex_fixture() {
+        use std::io::BufRead;
+        use std::os::windows::io::FromRawHandle;
+        use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
+        use windows_sys::Win32::Storage::FileSystem::SYNCHRONIZE;
+        use windows_sys::Win32::Storage::FileSystem::{
+            CreateFileW, FILE_READ_ATTRIBUTES, FILE_READ_DATA, FILE_WRITE_DATA, OPEN_EXISTING,
+        };
+        let Ok(name) = std::env::var("CHANNEL_PIPE") else {
+            return;
+        };
+        let name: Vec<u16> = name.encode_utf16().chain(Some(0)).collect();
+        let handle = unsafe {
+            CreateFileW(
+                name.as_ptr(),
+                FILE_READ_DATA | FILE_WRITE_DATA | FILE_READ_ATTRIBUTES | SYNCHRONIZE,
+                0,
+                std::ptr::null(),
+                OPEN_EXISTING,
+                0,
+                std::ptr::null_mut(),
+            )
+        };
+        assert_ne!(handle, INVALID_HANDLE_VALUE);
+        let mut writer = unsafe { File::from_raw_handle(handle) };
+        let mut reader = std::io::BufReader::new(writer.try_clone().unwrap());
+        let role = std::env::var("CHANNEL_TEST_ROLE").unwrap();
+        if role == "no-read" {
+            std::thread::sleep(Duration::from_secs(30));
+            return;
+        }
+        let mut queued = VecDeque::new();
+        if role == "echo-approve" {
+            writeln!(writer, "{}", json!({"kind":"request","id":90,"method":"approve","params":{"connector":"Slack","action":"send","preview":[]}})).unwrap();
+            loop {
+                let mut line = String::new();
+                assert_ne!(reader.read_line(&mut line).unwrap(), 0);
+                let frame: Value = serde_json::from_str(&line).unwrap();
+                // Parent requests can precede the approval response: the handler
+                // notifies the parent before its answer is queued for transmission.
+                if frame["kind"] == "request" {
+                    queued.push_back(frame);
+                    continue;
+                }
+                assert_eq!(frame["kind"], "response");
+                assert_eq!(frame["id"], 90);
+                assert_eq!(frame["result"], json!({"approved":true}));
+                break;
+            }
+        }
+        loop {
+            let frame = if let Some(frame) = queued.pop_front() {
+                frame
+            } else {
+                let mut line = String::new();
+                if reader.read_line(&mut line).unwrap() == 0 {
+                    return;
+                }
+                serde_json::from_str::<Value>(&line).unwrap()
+            };
+            assert_eq!(frame["kind"], "request");
+            if role == "hold" {
+                continue;
+            }
+            writeln!(
+                writer,
+                "{}",
+                json!({"kind":"response","id":frame["id"],"result":frame["params"]})
+            )
+            .unwrap();
+            return;
+        }
+    }
+
+    fn workers_released(channel: &Arc<AppChannel>) {
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while Arc::strong_count(channel) != 1 {
+            assert!(
+                Instant::now() < deadline,
+                "channel workers retained resources after close"
+            );
+            std::thread::yield_now();
+        }
+    }
+
+    #[test]
+    fn windows_channel_duplex_round_trip_approval_and_eof() {
+        let (mut process, channel, approvals) = duplex_fixture("echo-approve");
+        assert_eq!(
+            approvals.recv_timeout(Duration::from_secs(5)).unwrap(),
+            "app-channel-request"
+        );
+        let result = channel.request("echo", json!({"value":7}), Duration::from_secs(5));
+        let exit = process.wait(5000).unwrap();
+        process.stop().unwrap();
+        assert_eq!(result, Ok(json!({"value":7})));
+        assert_eq!(exit, Some(0));
+        workers_released(&channel);
+        assert!(!channel.is_open());
+    }
+
+    #[test]
+    fn windows_channel_duplex_timeout_and_blocked_reader_close() {
+        let (mut process, channel, _) = duplex_fixture("hold");
+        assert_eq!(
+            channel.request("echo", Value::Null, Duration::from_millis(100)),
+            Err("The assistant did not answer in time.".into())
+        );
+        assert!(
+            channel.is_open(),
+            "response timeout revoked a usable transport"
+        );
+        let started = Instant::now();
+        channel.close();
+        let elapsed = started.elapsed();
+        // Prove workers release while peer is still alive, not because stop unblocks I/O.
+        workers_released(&channel);
+        process.stop().unwrap();
+        assert!(elapsed < Duration::from_secs(1));
+        assert!(!channel.is_open());
+    }
+
+    #[test]
+    fn windows_channel_duplex_stalled_write_deadline_releases_workers() {
+        let (mut process, channel, _) = duplex_fixture("no-read");
+        let started = Instant::now();
+        let result = channel.request(
+            "echo",
+            Value::String("x".repeat(900_000)),
+            Duration::from_millis(200),
+        );
+        let elapsed = started.elapsed();
+        let revoked = !channel.is_open();
+        workers_released(&channel);
+        process.stop().unwrap();
+        assert_eq!(result, Err("The assistant did not answer in time.".into()));
+        assert!(revoked);
+        assert!(elapsed < Duration::from_secs(1));
+    }
 
     fn fixture(role: &str) -> (OwnedProcess, ParentStdio) {
         use std::ffi::OsString;

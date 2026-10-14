@@ -102,13 +102,17 @@ impl LogonGroups {
     }
 }
 
-struct ServerEndpoint {
+pub(crate) struct ServerEndpoint {
     handle: Handle,
     name: String,
 }
 impl ServerEndpoint {
-    fn create() -> io::Result<Self> {
+    pub(crate) fn create() -> io::Result<Self> {
         Self::create_named(random_name()?)
+    }
+
+    pub(crate) fn name(&self) -> &str {
+        &self.name
     }
 
     // Private implementation detail; only tests inject a name, never callers.
@@ -165,7 +169,7 @@ impl ServerEndpoint {
         }
     }
 
-    fn accept_owned(
+    pub(crate) fn accept_owned(
         self,
         identity: RetainedIdentity,
         deadline: Instant,
@@ -240,13 +244,13 @@ fn timed_out() -> io::Error {
 }
 
 // Matches the retained live OS process, not a secret or compromise-resistant authentication.
-struct VerifiedEndpoint {
+pub(crate) struct VerifiedEndpoint {
     _endpoint: UnverifiedEndpoint,
 }
 
 impl VerifiedEndpoint {
     /// Transfers the pipe into independently signaled, sequential I/O halves.
-    fn into_duplex(self) -> io::Result<(PipeReader, PipeWriter)> {
+    pub(crate) fn into_duplex(self) -> io::Result<(PipeReader, PipeWriter)> {
         let reader_event = direction_event()?;
         let writer_event = direction_event()?;
         // Suppress disconnect-on-drop while moving the sole owned pipe handle.
@@ -275,22 +279,22 @@ fn direction_event() -> io::Result<OwnedHandle> {
     Ok(unsafe { OwnedHandle::from_raw_handle(event) })
 }
 
-#[derive(Default)]
+#[derive(Debug, Default)]
 struct TransferState {
     revoked: bool,
     // Address of the boxed OVERLAPPED, valid only while protected by this mutex.
     active: Option<usize>,
 }
 
-#[derive(Clone)]
-struct PipeCancellation {
+#[derive(Debug, Clone)]
+pub(crate) struct PipeCancellation {
     pipe: std::sync::Arc<OwnedHandle>,
     state: std::sync::Arc<std::sync::Mutex<TransferState>>,
 }
 
 impl PipeCancellation {
     /// Permanently revokes this direction without waiting for I/O settlement.
-    fn cancel(&self) -> io::Result<()> {
+    pub(crate) fn cancel(&self) -> io::Result<()> {
         let mut state = self
             .state
             .lock()
@@ -313,6 +317,7 @@ impl PipeCancellation {
     }
 }
 
+#[derive(Debug)]
 struct PipeDirection {
     pipe: std::sync::Arc<OwnedHandle>,
     event: OwnedHandle,
@@ -374,9 +379,10 @@ impl PipeDirection {
     }
 }
 
-struct PipeReader(PipeDirection);
+#[derive(Debug)]
+pub(crate) struct PipeReader(PipeDirection);
 impl PipeReader {
-    fn cancellation(&self) -> PipeCancellation {
+    pub(crate) fn cancellation(&self) -> PipeCancellation {
         PipeCancellation {
             pipe: self.0.pipe.clone(),
             state: self.0.state.clone(),
@@ -389,9 +395,10 @@ impl io::Read for PipeReader {
     }
 }
 
-struct PipeWriter(PipeDirection);
+#[derive(Debug)]
+pub(crate) struct PipeWriter(PipeDirection);
 impl PipeWriter {
-    fn cancellation(&self) -> PipeCancellation {
+    pub(crate) fn cancellation(&self) -> PipeCancellation {
         PipeCancellation {
             pipe: self.0.pipe.clone(),
             state: self.0.state.clone(),
