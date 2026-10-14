@@ -557,6 +557,120 @@ mod tests {
         assert_eq!(recreated.name, name);
     }
 
+    // Match the stdio race test's identity probe, not numeric handle presence.
+    fn has_object(process: HANDLE, handle: HANDLE) -> bool {
+        let mut copied = ptr::null_mut();
+        if unsafe {
+            DuplicateHandle(
+                process,
+                handle,
+                GetCurrentProcess(),
+                &mut copied,
+                0,
+                0,
+                DUPLICATE_SAME_ACCESS,
+            )
+        } == 0
+        {
+            assert_eq!(io::Error::last_os_error().raw_os_error(), Some(6));
+            return false;
+        }
+        let copied = Handle(copied);
+        unsafe { CompareObjectHandles(copied.0, handle) != 0 }
+    }
+
+    #[test]
+    fn windows_bootstrap_endpoint_identity_probe_detects_child_inheritance() {
+        use std::os::windows::process::CommandExt;
+
+        let endpoint = ServerEndpoint::create().unwrap();
+        let mut duplicate = ptr::null_mut();
+        checked(unsafe {
+            DuplicateHandle(
+                GetCurrentProcess(),
+                endpoint.handle.0,
+                GetCurrentProcess(),
+                &mut duplicate,
+                0,
+                1,
+                DUPLICATE_SAME_ACCESS,
+            )
+        })
+        .unwrap();
+        let duplicate = Handle(duplicate);
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "owned_process_windows::native_tests::windows_owned_fixture",
+            ])
+            .env_clear()
+            .env("OWNED_PROCESS_TEST_ROLE", "exit")
+            .creation_flags(CREATE_SUSPENDED)
+            .spawn()
+            .unwrap();
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            assert!(
+                has_object(child.as_raw_handle(), duplicate.0),
+                "identity probe missed deliberately inherited bootstrap duplicate"
+            );
+            assert!(
+                !has_object(child.as_raw_handle(), endpoint.handle.0),
+                "child inherited the original non-inheritable bootstrap endpoint"
+            );
+        }));
+        drop(duplicate);
+        child.kill().unwrap();
+        child.wait().unwrap();
+        if let Err(panic) = result {
+            std::panic::resume_unwind(panic);
+        }
+    }
+
+    #[test]
+    fn windows_bootstrap_endpoint_unrelated_concurrent_launch_never_inherits() {
+        use std::os::windows::process::CommandExt;
+
+        let endpoint = ServerEndpoint::create().unwrap();
+        let pipe = endpoint.handle.0;
+        // Positive control checks the identity probe against a known duplicate.
+        assert!(has_object(unsafe { GetCurrentProcess() }, pipe));
+        let mut flags = 0;
+        checked(unsafe { GetHandleInformation(pipe, &mut flags) }).unwrap();
+        assert_eq!(flags & HANDLE_FLAG_INHERIT, 0);
+
+        let launcher = std::thread::spawn(|| {
+            // Same ordinary Command fixture as the stdio race test. Suspension
+            // prevents exit or runtime handle reuse before the identity check.
+            std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "owned_process_windows::native_tests::windows_owned_fixture",
+                ])
+                .env_clear()
+                .env("OWNED_PROCESS_TEST_ROLE", "exit")
+                .creation_flags(CREATE_SUSPENDED)
+                .spawn()
+                .unwrap()
+        });
+        let mut unrelated = launcher.join().unwrap();
+        // Always clean up the suspended process, even if the probe panics.
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            checked(unsafe { GetHandleInformation(pipe, &mut flags) }).unwrap();
+            assert_eq!(flags & HANDLE_FLAG_INHERIT, 0);
+            assert!(has_object(unsafe { GetCurrentProcess() }, pipe));
+            assert!(
+                !has_object(unrelated.as_raw_handle(), pipe),
+                "unrelated Command inherited the bootstrap endpoint"
+            );
+        }));
+        unrelated.kill().unwrap();
+        unrelated.wait().unwrap();
+        if let Err(panic) = result {
+            std::panic::resume_unwind(panic);
+        }
+        // This covers the live endpoint scenario, not every launcher or timing.
+    }
+
     #[test]
     fn windows_bootstrap_endpoint_handle_and_policy() {
         let endpoint = ServerEndpoint::create().unwrap();
