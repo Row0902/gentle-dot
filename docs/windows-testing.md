@@ -124,7 +124,7 @@ Open **Connectors** in the header.
 
 ### 12. Connector secrets and approvals — not yet on Windows
 
-The app cannot answer connector secret requests or show native connector/approval dialogs until W7 lands the private app-to-daemon channel. Connectors that need a secret or an approval fail closed.
+The app cannot answer connector secret requests or show native connector/approval dialogs until W7 lands the private app-to-daemon channel. Connectors that need a secret or an approval fail closed. When it lands, the channel is a named pipe: the credential is the connecting process's PID checked against the handle the app retained from spawning the daemon, not the pipe's name, which any same-user process can see (`docs/design.md`, S25.1).
 
 **Expected today:** write **N/A** for this step. The one thing that can be checked is the store itself, in step 14.
 
