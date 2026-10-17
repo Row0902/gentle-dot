@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 import { existsSync } from "node:fs";
 import { fileURLToPath } from "node:url";
-import { inheritedAppSocket } from "./app-channel.ts";
+import { inheritedAppSocket, openStdioChannel } from "./app-channel.ts";
 import { serveAuthHelper } from "./auth-helper.ts";
 import { loadConfig } from "./config.ts";
 import { APPROVAL_GUARD, bundledMcpCli } from "./connectors.ts";
@@ -37,11 +37,11 @@ function selfCheck(): void {
 	process.exit(ok ? 0 : 1);
 }
 
-async function main(): Promise<void> {
+async function main(stdioChannel?: ReturnType<typeof openStdioChannel>): Promise<void> {
 	const config = loadConfig();
 	// The desktop app that launched the daemon hands over its private channel on fd 3 (S25.1); it is
 	// opened before anything is spawned, and refused if children would inherit it.
-	const appChannel = inheritedAppSocket({ log });
+	const appChannel = stdioSelected ? stdioChannel : inheritedAppSocket({ log });
 	// Server mode only when GENTLE_DOT_VPS says so (S25.8). The secrets key is read once and removed
 	// from the process environment, so no child the daemon starts can inherit it.
 	const vps = loadVpsOptions(process.env, { uid: process.getuid?.() ?? -1 });
@@ -64,7 +64,8 @@ async function main(): Promise<void> {
 			: {}),
 		log,
 	});
-	process.stdout.write(`${startupMessage(daemon.url, config.dataDir, process.stdout.isTTY === true)}\n`);
+	if (!stdioSelected)
+		process.stdout.write(`${startupMessage(daemon.url, config.dataDir, process.stdout.isTTY === true)}\n`);
 
 	let closing = false;
 	const shutdown = (signal: string) => {
@@ -82,10 +83,27 @@ async function main(): Promise<void> {
 	void daemon.closed.then(() => process.exit(0));
 }
 
+// This nonsecret flag selects transport only; pipe possession supplies the capability.
+const stdioSelected = process.argv.includes("--app-channel-stdio");
+let stdioChannel: ReturnType<typeof openStdioChannel>;
+if (stdioSelected) {
+	if (process.argv.includes("--self-check")) {
+		log("--app-channel-stdio cannot be combined with --self-check");
+		process.exit(1);
+	}
+	try {
+		// Validate selection synchronously, before any config or stdout-producing branch.
+		stdioChannel = openStdioChannel({ selected: true, log });
+	} catch (error) {
+		log(`failed to start: ${error instanceof Error ? error.message : String(error)}`);
+		process.exit(1);
+	}
+}
+
 if (process.argv.includes("--auth-helper")) serveAuthHelper();
 else {
 	if (process.argv.includes("--self-check")) selfCheck();
-	main().catch((error: Error) => {
+	main(stdioChannel).catch((error: Error) => {
 		log(`failed to start: ${error.message}`);
 		process.exit(1);
 	});

@@ -15,7 +15,7 @@
 import { type StdioOptions, spawnSync } from "node:child_process";
 import { closeSync, fstatSync } from "node:fs";
 import { Socket } from "node:net";
-import type { Duplex } from "node:stream";
+import { Duplex, type Readable, type Writable } from "node:stream";
 
 /** Where the app puts its end of the channel. */
 export const APP_FD = 3;
@@ -154,10 +154,15 @@ export class AppChannel implements AppLink {
 		for (let end = this.buffer.indexOf("\n"); end >= 0; end = this.buffer.indexOf("\n")) {
 			const line = this.buffer.slice(0, end);
 			this.buffer = this.buffer.slice(end + 1);
+			if (Buffer.byteLength(line) > MAX_FRAME) {
+				this.log("the app's channel sent a frame that is too long; closing it");
+				this.close();
+				return;
+			}
 			if (line.trim() !== "") this.onFrame(line);
 			if (!this.open) return;
 		}
-		if (this.buffer.length > MAX_FRAME) {
+		if (Buffer.byteLength(this.buffer) > MAX_FRAME) {
 			this.log("the app's channel sent a frame that is too long; closing it");
 			this.close();
 		}
@@ -256,6 +261,141 @@ export function inheritedAppSocket(options: InheritedChannelOptions = {}): Socke
 		return undefined;
 	}
 	return new Socket({ fd, readable: true, writable: true });
+}
+
+export interface StdioChannelOptions extends AppChannelOptions {
+	/** Explicit nonsecret selection; never inferred from redirected streams. */
+	selected: boolean;
+	/** Injectable only to make platform selection deterministic in tests. */
+	platform?: NodeJS.Platform;
+	reader?: Readable;
+	writer?: Writable;
+}
+
+/**
+ * Windows private-stdio bootstrap. Pipe possession is the capability, not proof of app origin.
+ * Borrows the endpoints: closing detaches and pauses input, but never destroys/ends host stdio.
+ * The future CLI owns process shutdown and must reserve stdout for protocol bytes in selected mode.
+ */
+export function openStdioChannel(options: StdioChannelOptions): AppChannel | undefined {
+	if (!options.selected) return undefined;
+	if ((options.platform ?? process.platform) !== "win32") {
+		throw new Error("The stdio app channel is only supported on Windows.");
+	}
+	const reader = options.reader ?? process.stdin;
+	const writer = options.writer ?? process.stdout;
+	const stream = new StdioDuplex(reader, writer);
+	const channel = new AppChannel(stream, options);
+	stream.start();
+	return channel;
+}
+
+/** Bounded borrowed-stream bridge; at most one write is submitted to the endpoint at a time. */
+class StdioDuplex extends Duplex {
+	private completeWrite?: (error?: Error | null) => void;
+	private writeOutstanding = false;
+	private readonly data = (chunk: Buffer | string) => {
+		if (!this.push(chunk)) this.reader.pause();
+	};
+	private readonly eof = () => this.push(null);
+	private readonly failed = (error: Error) => this.destroy(error);
+	private readonly gone = () => this.destroy();
+
+	private readonly reader: Readable;
+	private readonly writer: Writable;
+
+	constructor(reader: Readable, writer: Writable) {
+		super({ readableHighWaterMark: 64 * 1024, writableHighWaterMark: 64 * 1024 });
+		this.reader = reader;
+		this.writer = writer;
+	}
+
+	start(): void {
+		this.reader.on("data", this.data);
+		this.reader.on("end", this.eof);
+		this.reader.on("error", this.failed);
+		this.reader.on("close", this.gone);
+		this.writer.on("error", this.failed);
+		this.writer.on("close", this.gone);
+		this.writer.on("finish", this.gone);
+		if (
+			this.reader.destroyed ||
+			this.reader.readableEnded ||
+			this.writer.destroyed ||
+			this.writer.writableEnded
+		) {
+			this.destroy();
+		}
+	}
+
+	override _read(): void {
+		if (!this.destroyed) this.reader.resume();
+	}
+
+	override write(chunk: string | Uint8Array, callback?: (error?: Error | null) => void): boolean;
+	override write(
+		chunk: string | Uint8Array,
+		encoding: BufferEncoding,
+		callback?: (error?: Error | null) => void,
+	): boolean;
+	override write(
+		chunk: string | Uint8Array,
+		encodingOrCallback?: BufferEncoding | ((error?: Error | null) => void),
+		callback?: (error?: Error | null) => void,
+	): boolean {
+		const bytes =
+			typeof chunk === "string"
+				? Buffer.byteLength(chunk, typeof encodingOrCallback === "string" ? encodingOrCallback : "utf8")
+				: chunk.byteLength;
+		if (this.writableLength + bytes > MAX_FRAME + 1) {
+			const error = new Error("The app's stdio output queue is too long.");
+			this.destroy(error);
+			(typeof encodingOrCallback === "function" ? encodingOrCallback : callback)?.(error);
+			return false;
+		}
+		return typeof encodingOrCallback === "string"
+			? super.write(chunk, encodingOrCallback, callback)
+			: super.write(chunk, encodingOrCallback);
+	}
+
+	override _write(chunk: Buffer, _encoding: BufferEncoding, done: (error?: Error | null) => void): void {
+		this.completeWrite = done;
+		this.writeOutstanding = true;
+		try {
+			this.writer.write(chunk, (error) => {
+				this.writeOutstanding = false;
+				const complete = this.completeWrite;
+				this.completeWrite = undefined;
+				complete?.(error);
+				if (this.destroyed) this.releaseWriterGuard();
+			});
+		} catch (error) {
+			this.writeOutstanding = false;
+			this.completeWrite = undefined;
+			done(error as Error);
+		}
+	}
+
+	private releaseWriterGuard(): void {
+		// The endpoint emits a callback failure as an error event after its callback.
+		// Pending borrowed I/O retains the guard even after adapter completion is cleared.
+		if (!this.writeOutstanding) setImmediate(() => this.writer.off("error", this.failed));
+	}
+
+	override _destroy(error: Error | null, done: (error?: Error | null) => void): void {
+		this.reader.pause();
+		this.reader.off("data", this.data);
+		this.reader.off("end", this.eof);
+		this.reader.off("error", this.failed);
+		this.reader.off("close", this.gone);
+		this.releaseWriterGuard();
+		this.writer.off("close", this.gone);
+		this.writer.off("finish", this.gone);
+		const complete = this.completeWrite;
+		this.completeWrite = undefined;
+		complete?.(error ?? new Error("The app's stdio channel closed."));
+		done(error);
+	}
 }
 
 /** {@link inheritedAppSocket} as a channel. */

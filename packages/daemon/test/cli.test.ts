@@ -10,6 +10,128 @@ import { expectPosixMode } from "./support/posix-modes.ts";
 const CLI = fileURLToPath(new URL("../src/cli.ts", import.meta.url));
 
 describe("gentle-dot command", () => {
+	it("rejects stdio mode with self-check before writing any stdout", async () => {
+		const child = spawn(process.execPath, [CLI, "--app-channel-stdio", "--self-check"], {
+			stdio: ["pipe", "pipe", "pipe"],
+		});
+		let stdout = "";
+		let stderr = "";
+		child.stdout.on("data", (chunk: Buffer) => {
+			stdout += chunk.toString();
+		});
+		child.stderr.on("data", (chunk: Buffer) => {
+			stderr += chunk.toString();
+		});
+		const code = await new Promise((resolve) => child.on("close", resolve));
+		expect(code).toBe(1);
+		expect(stdout).toBe("");
+		expect(stderr).toMatch(/--app-channel-stdio.*--self-check/);
+	});
+
+	it.skipIf(process.platform === "win32")("rejects stdio selection on non-Windows", async () => {
+		const child = spawn(process.execPath, [CLI, "--app-channel-stdio"], {
+			stdio: ["pipe", "pipe", "pipe"],
+		});
+		let stdout = "";
+		let stderr = "";
+		child.stdout.on("data", (chunk: Buffer) => {
+			stdout += chunk.toString();
+		});
+		child.stderr.on("data", (chunk: Buffer) => {
+			stderr += chunk.toString();
+		});
+		const code = await new Promise((resolve) => child.on("close", resolve));
+		expect(code).toBe(1);
+		expect(stdout).toBe("");
+		expect(stderr).toMatch(/only supported on Windows/);
+	});
+
+	it.skipIf(process.platform !== "win32")(
+		"accepts Windows stdio mode without startup text and exits when its peer closes",
+		async () => {
+			const child = spawn(process.execPath, [CLI, "--app-channel-stdio"], {
+				env: {
+					...process.env,
+					GENTLE_DOT_DATA_DIR: join(tempDir(), "data"),
+					GENTLE_DOT_PORT: "0",
+					GENTLE_DOT_AGENT_BIN: process.execPath,
+					GENTLE_DOT_AGENT_ARGS: JSON.stringify([FAKE_AGENT]),
+				},
+				stdio: ["pipe", "pipe", "pipe"],
+			});
+			let stdout = "";
+			let stderr = "";
+			let pendingFrames = "";
+			child.stdout.on("data", (chunk: Buffer) => {
+				stdout += chunk.toString();
+				pendingFrames += chunk.toString();
+				for (let end = pendingFrames.indexOf("\n"); end >= 0; end = pendingFrames.indexOf("\n")) {
+					const line = pendingFrames.slice(0, end);
+					pendingFrames = pendingFrames.slice(end + 1);
+					try {
+						const frame = JSON.parse(line);
+						if (frame.kind === "request")
+							child.stdin.write(
+								`${JSON.stringify({
+									kind: "response",
+									id: frame.id,
+									result: null,
+								})}\n`,
+							);
+					} catch {
+						/* Startup text must fail the assertions below, not the event callback. */
+					}
+				}
+			});
+			child.stderr.on("data", (chunk: Buffer) => {
+				stderr += chunk.toString();
+			});
+			const exited = new Promise<number | null>((resolve) => child.on("close", resolve));
+			let code: number | null = null;
+			try {
+				// A real peer request must reach the daemon handler and return a framed answer.
+				await waitFor(() => stdout.includes('"method":"secret_get"'), 15_000);
+				child.stdin.write(`${JSON.stringify({ kind: "request", id: 71, method: "computer_unregister" })}\n`);
+				await waitFor(
+					() =>
+						stdout.split("\n").some((line) => {
+							try {
+								const frame = JSON.parse(line);
+								return frame.kind === "response" && frame.id === 71 && frame.result !== undefined;
+							} catch {
+								return false;
+							}
+						}),
+					15_000,
+				);
+				const answer = stdout
+					.split("\n")
+					.filter(Boolean)
+					.map((line) => JSON.parse(line))
+					.find((frame) => frame.kind === "response" && frame.id === 71 && frame.result !== undefined);
+				expect(answer).toEqual({ kind: "response", id: 71, result: {} });
+				expect(stdout).not.toContain("Gentle Dot is running");
+				expect(stdout).not.toContain("the access key is in");
+				for (const line of stdout.trim().split("\n")) expect(() => JSON.parse(line)).not.toThrow();
+				child.stdin.end();
+				let closed = false;
+				void exited.then((value) => {
+					code = value;
+					closed = true;
+				});
+				await waitFor(() => closed, 15_000);
+			} catch (error) {
+				throw new Error(`stdio exchange failed: stdout=${stdout}; stderr=${stderr}`, { cause: error });
+			} finally {
+				child.kill("SIGTERM");
+				await exited;
+			}
+			expect(code).toBe(0);
+			expect(stdout).not.toContain("Gentle Dot is running");
+			expect(stderr).toContain("the desktop app's channel closed; stopping the assistant");
+		},
+	);
+
 	it("keeps the access key out of redirected output, such as a log file", async () => {
 		const dataDir = join(tempDir(), "data");
 		const child = spawn(process.execPath, [CLI], {

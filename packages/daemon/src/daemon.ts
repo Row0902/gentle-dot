@@ -79,7 +79,7 @@ export interface DaemonOptions {
 	 * Without it, connector changes and approvals fail closed. With it, the daemon stops when the
 	 * channel closes (S35.2): the app that launched it is gone.
 	 */
-	appChannel?: Duplex;
+	appChannel?: Duplex | AppChannel;
 	/** How long an approval waits for the app's answer; default 130 s (the app declines at 120 s). */
 	approvalWaitMs?: number;
 	/**
@@ -183,12 +183,15 @@ export async function startDaemon(options: DaemonOptions): Promise<DotDaemon> {
 		agentEnv.GENTLE_PI_CONFIG_HOME = join(options.dataDir, "gentle-ai");
 	}
 	const agentHome = options.agentHome ?? resolveAgentHome(process.env, options.dataDir);
-	const app = options.appChannel
-		? new AppChannel(options.appChannel, {
-				log,
-				...(options.approvalWaitMs ? { approvalWaitMs: options.approvalWaitMs } : {}),
-			})
-		: undefined;
+	const app =
+		options.appChannel instanceof AppChannel
+			? options.appChannel
+			: options.appChannel
+				? new AppChannel(options.appChannel, {
+						log,
+						...(options.approvalWaitMs ? { approvalWaitMs: options.approvalWaitMs } : {}),
+					})
+				: undefined;
 	// The approved connectors are read once, here; the engine cannot change them (docs/design.md).
 	// Their secrets come from the app's secure store over its channel, and only into memory (S25.5).
 	const connectorStore = new ConnectorStore({
