@@ -15,5 +15,7 @@ mod shell;
 pub mod shortcut;
 pub mod status;
 pub mod voice;
+#[cfg(windows)]
+mod win_spawn;
 
 pub use shell::run;

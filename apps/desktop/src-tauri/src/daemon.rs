@@ -549,21 +549,16 @@ fn spawn_daemon(spec: &LaunchSpec, log: File, channel: Option<BorrowedFd<'_>>) -
     Ok(Box::new(command.spawn()?))
 }
 
-/// Windows has no fd 3 to place a channel on and no other descriptor of the app to withhold, so
-/// the daemon gets its stdio and the log and nothing else. The channel is a named pipe the app
-/// creates before the spawn; the daemon receives its name in `GENTLE_DOT_CHANNEL_PIPE` (set on
-/// `spec.envs` before this runs) and connects to it.
+/// Windows has no fd 3 to place a channel on, so the daemon gets `NUL` as stdin, the log as stdout
+/// and stderr, and no other handle of the app: `win_spawn` lists exactly those two in
+/// `PROC_THREAD_ATTRIBUTE_HANDLE_LIST`, so a handle some library of the app made inheritable never
+/// reaches the daemon (W29). The channel is a named pipe the app creates before the spawn; the
+/// daemon receives its name in `GENTLE_DOT_CHANNEL_PIPE` (set on `spec.envs` before this runs) and
+/// connects to it.
 #[cfg(windows)]
 fn spawn_daemon(spec: &LaunchSpec, log: File) -> io::Result<Box<dyn ChildProcess>> {
-    use std::process::{Command, Stdio};
-    let child = Command::new(&spec.program)
-        .args(&spec.args)
-        .envs(spec.envs.iter().map(|(k, v)| (k, v)))
-        .stdin(Stdio::null())
-        .stdout(log.try_clone()?)
-        .stderr(log)
-        .spawn()?;
-    Ok(Box::new(child))
+    let spawn = crate::win_spawn::Spawn { program: &spec.program, args: &spec.args, envs: &spec.envs };
+    Ok(Box::new(crate::win_spawn::spawn(&spawn, &log)?))
 }
 
 /// Marks every descriptor from `first` up close-on-exec. Called between fork and exec: system
@@ -1497,6 +1492,59 @@ done"#;
         daemon.stop();
         assert!(daemon.channel().is_none());
         assert!(!channel.is_open());
+    }
+
+    /// The handles of this process that are inheritable and not in `before`, once the ones other
+    /// tests make inheritable for the length of their own spawns are gone (within 5 s): a handle a
+    /// spawn leaves inheritable stays.
+    #[cfg(windows)]
+    fn new_inheritable(before: &[usize]) -> Vec<usize> {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let new: Vec<usize> = crate::win_spawn::tests::inheritable_handles().into_iter().filter(|h| !before.contains(h)).collect();
+            if new.is_empty() || Instant::now() >= deadline {
+                return new;
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    /// The daemon holds nothing of the app but `NUL` as stdin and the log as stdout and stderr,
+    /// whatever else the app made inheritable (W29): the daemon enumerates every inheritable handle
+    /// it holds. The spawn, and a spawn that fails, leave the app's own inheritable set as it was.
+    #[cfg(windows)]
+    #[test]
+    fn the_daemon_inherits_only_nul_and_the_log() {
+        use crate::win_spawn::tests::{helper_spec, inheritable_handles, path_of_handle, plant, Inherited};
+        use std::os::windows::io::AsRawHandle;
+        use windows_sys::Win32::Storage::FileSystem::FILE_TYPE_CHAR;
+        let dir = scratch_dir("daemon-inherits");
+        fs::create_dir_all(&dir).unwrap();
+        let strays = plant(&dir);
+        let before = inheritable_handles();
+        let planted: Vec<usize> = strays.iter().map(|h| h.as_raw_handle() as usize).collect();
+        assert!(!planted.is_empty() && planted.iter().all(|h| before.contains(h)), "planted {planted:x?}, inheritable {before:x?}");
+        let log_path = dir.join("log");
+        let log = File::create(&log_path).unwrap();
+        let log_name = path_of_handle(log.as_raw_handle() as _).unwrap();
+        let mut child = spawn_daemon(&helper_spec("inh"), log).unwrap();
+        assert!(child.wait().unwrap().success());
+        let text = fs::read_to_string(&log_path).unwrap();
+        let seen = Inherited::parse(&text);
+        let mut expected = vec![seen.stdin, seen.stdout];
+        expected.sort_unstable();
+        assert_eq!(seen.handles, expected, "the daemon holds more than stdin and stdout: {seen:x?}");
+        assert_eq!(seen.stderr, seen.stdout, "{seen:x?}");
+        assert_eq!(seen.stdin_type, FILE_TYPE_CHAR, "stdin is not NUL: {seen:x?}");
+        assert!(seen.stdout_path.eq_ignore_ascii_case(&log_name), "stdout is not the log ({log_name}): {seen:x?}");
+        assert_eq!(new_inheritable(&before), Vec::<usize>::new(), "the spawn left a handle inheritable");
+        let missing = LaunchSpec { program: dir.join("missing.exe").display().to_string(), args: vec![], envs: vec![] };
+        assert!(spawn_daemon(&missing, File::create(dir.join("log2")).unwrap()).is_err());
+        assert_eq!(new_inheritable(&before), Vec::<usize>::new(), "the failed spawn left a handle inheritable");
+        let after = inheritable_handles();
+        assert!(planted.iter().all(|h| after.contains(h)), "a planted handle changed: {after:x?}");
+        drop(strays);
+        let _ = fs::remove_dir_all(&dir);
     }
 
     /// A stand-in for a daemon this app did not launch (`pnpm dev`, or one an older app left): it
