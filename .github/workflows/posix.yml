@@ -14,7 +14,9 @@ name: POSIX
 
 on:
   push:
-    branches: [main]
+    # `port/open-prs` is listed while that integration branch is being measured on the runners;
+    # the line goes away when it is deleted.
+    branches: [main, port/open-prs]
   pull_request:
   workflow_dispatch:
 

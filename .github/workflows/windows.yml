@@ -16,7 +16,7 @@ on:
     # `main` is the branch this workflow guards. `feat/windows-port` is listed while the staged port
     # lives there, because its own pushes would otherwise never run the suite they change (W27); the
     # line goes away with the branch when the port merges.
-    branches: [main, feat/windows-port]
+    branches: [main, feat/windows-port, port/open-prs]
   pull_request:
   workflow_dispatch:
 
