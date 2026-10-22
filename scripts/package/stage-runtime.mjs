@@ -208,6 +208,8 @@ function installDaemonModules(out, target) {
 	say("Daemon dependencies (npm install --omit=dev)");
 	const windows = TARGETS[target].platform === "win32";
 	// A clean npm setup: no user npmrc, a cache of its own, and a scratch HOME for install scripts.
+	// Pin pi-codemode@1.0.4 to avoid version drift: pi-codemode@1.2.0 removed MCP_TYPESCRIPT_PREAMBLE
+	// export that the daemon's codemode integration expects (see #64).
 	const result = spawnSync(
 		windows ? join(out, "node", "node.exe") : join(out, "node", "bin", "node"),
 		[
