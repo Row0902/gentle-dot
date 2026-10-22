@@ -4,6 +4,9 @@ version = "0.1.0"
 description = "Gentle Dot desktop shell"
 edition = "2021"
 publish = false
+# macOS 27 / Xcode 27 refuses proc-macro dylibs built by Rust < 1.99 (issue #53);
+# the floor is stated once here rather than diagnosed as a dyld error at load time.
+rust-version = "1.99"
 
 [lib]
 name = "gentle_dot_lib"
