@@ -139,9 +139,9 @@ describe("loadConfig", () => {
 			"Invalid duration",
 		);
 		// A day is the sane ceiling; anything above is almost surely a unit mistake.
-		expect(() => loadConfig({ GENTLE_DOT_DATA_DIR: dataDir, GENTLE_DOT_TURN_TIMEOUT_MS: "86400001" })).toThrow(
-			"Invalid duration",
-		);
+		expect(() =>
+			loadConfig({ GENTLE_DOT_DATA_DIR: dataDir, GENTLE_DOT_TURN_TIMEOUT_MS: "86400001" }),
+		).toThrow("Invalid duration");
 		writeFileSync(join(dataDir, "config.json"), JSON.stringify({ turnTimeoutMs: -1 }));
 		expect(() => loadConfig({ GENTLE_DOT_DATA_DIR: dataDir })).toThrow("Invalid duration");
 	});

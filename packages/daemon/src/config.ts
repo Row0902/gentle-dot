@@ -167,8 +167,8 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): DotConfig {
 		allowedOrigins: parseList(env.GENTLE_DOT_ALLOWED_ORIGINS, "GENTLE_DOT_ALLOWED_ORIGINS"),
 		turnTimeoutMs: env.GENTLE_DOT_TURN_TIMEOUT_MS
 			? parseDurationMs(env.GENTLE_DOT_TURN_TIMEOUT_MS, "GENTLE_DOT_TURN_TIMEOUT_MS")
-			: (typeof file.turnTimeoutMs === "number"
+			: typeof file.turnTimeoutMs === "number"
 				? parseDurationMs(file.turnTimeoutMs, "config.json")
-				: 600_000),
+				: 600_000,
 	};
 }

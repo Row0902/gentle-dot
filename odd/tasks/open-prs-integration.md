@@ -43,6 +43,21 @@ Base: `feat/windows-port` at `6b1ccbb`. Every PR head is available as `origin/pr
    need their authors' design against the port, not a conflict resolution.
 4. **Nothing is claimed about behaviour until the suites run** (below).
 
+## Defects the merges exposed in the PRs themselves
+
+These are not integration costs. Each one means the PR, as opened, breaks the repository it targets:
+
+- **#75 leaves `main` failing `pnpm typecheck`.** It adds `{ type: "turn_timeout"; timeoutMs: number }`
+  to `ServerPayload` (`packages/protocol/src/index.ts:436`) and never adds a branch to the panel's
+  exhaustive switch in `packages/ui/src/store.ts`, so `reduceServer` no longer returns on every path
+  (TS2366). Measured here, not inferred: the case was absent from `origin/pr/75:packages/ui/src/store.ts`
+  and the port only fails once the merge lands. This branch adds the missing case (stop streaming;
+  the user-readable sentence arrives separately as an `error` with code `turn_timeout`).
+- **#78 leaves its own test failing.** It pins `@earendil-works/pi-codemode` in
+  `packages/daemon/package.json`, which adds an eighth entry to the staged runtime's dependency map,
+  while `packages/daemon/test/runtime-build.test.ts` still asserts the seven it knew. The expectation is
+  extended here, with the reason written next to it.
+
 ## Measurement
 
 Filled in by the runs recorded at the end of this branch.
