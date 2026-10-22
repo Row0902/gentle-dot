@@ -323,6 +323,11 @@ function reduceServer(state: DotState, message: ServerMessage): DotState {
 			};
 		case "interrupted":
 			return { ...state, interrupted: true };
+		// The run gave up waiting for the model (#75). The daemon sends an `error` carrying code
+		// `turn_timeout` right after this one and that is what the user reads; here the panel only
+		// has to stop presenting an answer that will never arrive.
+		case "turn_timeout":
+			return { ...state, messages: state.messages.map(stopStreaming) };
 		case "queue":
 			return { ...state, queue: { steering: message.steering, followUp: message.followUp } };
 		case "auth_providers":

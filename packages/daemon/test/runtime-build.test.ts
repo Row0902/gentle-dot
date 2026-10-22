@@ -101,6 +101,9 @@ describe("build:runtime", () => {
 		expect(manifest).toMatchObject({ private: true, type: "module" });
 		expect(manifest.dependencies).toEqual({
 			"@earendil-works/pi-ai": "1.2.0",
+		// Pinned by the daemon itself (PR #78, issue #64): the runtime must carry the version
+		// its lockfile resolves, or the engine fails at start on `MCP_TYPESCRIPT_PREAMBLE`.
+		"@earendil-works/pi-codemode": "1.0.4",
 			"@earendil-works/pi-coding-agent": "1.2.0",
 			"@earendil-works/pi-mcp": "1.2.0",
 			"@earendil-works/pi-tui": "1.2.0",

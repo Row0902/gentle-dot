@@ -286,7 +286,7 @@ mod tests {
         let list = candidates("Ctrl+Alt+K");
         assert_eq!(list[0], "Ctrl+Alt+K");
         assert!(same_keys(&list[1], Os::CURRENT.default_shortcut()));
-        assert!(list.iter().skip(2).eq(FALLBACKS.iter().copied().map(str::to_string)));
+        assert!(list.iter().skip(2).map(String::as_str).eq(FALLBACKS.iter().copied()));
     }
 
     #[test]
