@@ -30,6 +30,7 @@ import { directAccess, type EngineAccess, engineAccess } from "./engine-access.t
 import { approvalRequest } from "./extensions/approval-guard.ts";
 import {
 	claimEngineHome,
+	ensureGitBoundary,
 	ensureMemoryProject,
 	ensurePrivateDir,
 	isolatedAgentEnv,
@@ -198,6 +199,9 @@ async function startClaimedDaemon(
 		claimEngineHome(options.agentHome, log, access);
 	access(() => mkdirSync(options.workspace, { recursive: true, mode: 0o700 }));
 	ensureMemoryProject(options.workspace, access);
+	// The workspace is always the assistant's own: give it a git repository so the
+	// engine's preflight never resolves upward to the user's HOME (#51).
+	ensureGitBoundary(options.workspace, access);
 	const folderArgs = options.preferredFolder
 		? [
 				"--append-system-prompt",
