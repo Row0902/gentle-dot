@@ -114,6 +114,31 @@ pub trait Host {
     fn label_tray(&self, shortcut: &str);
 }
 
+/// Ordered alternatives tried at launch when the configured shortcut is taken (#50).
+/// Function keys avoid clashing with the shortcuts most desktops already hold.
+pub const FALLBACKS: &[&str] = &[
+    "Super+Space",
+    "Ctrl+Space",
+    "Alt+Shift+Space",
+    "Super+Shift+Space",
+];
+
+/// Launch candidates: the configured shortcut first (normalized), then this platform's own
+/// default (W9), then the rarer fallbacks, without duplicates and comparing as the same keys
+/// regardless of spelling. Bare function keys are deliberately absent: a global F1 is taken from
+/// every app that uses it for Help, and the chosen fallback is saved, so this chain is a rare path.
+pub fn candidates(preferred: &str) -> Vec<String> {
+    let os = Os::CURRENT;
+    let normalized = normalize(preferred, os).unwrap_or_else(|_| preferred.to_string());
+    let mut options = vec![normalized];
+    for fallback in [os.default_shortcut()].iter().chain(FALLBACKS.iter()).copied() {
+        if !options.iter().any(|option| same_keys(option, fallback)) {
+            options.push(fallback.to_string());
+        }
+    }
+    options
+}
+
 /// Applies a new panel shortcut at once. The new one is bound before the old one is released,
 /// so a refused or unsaved change leaves the old one working. Returns the saved spelling.
 pub fn apply(host: &impl Host, current: Option<&str>, requested: &str, os: Os) -> Result<String, String> {
@@ -219,6 +244,57 @@ mod tests {
             assert_eq!(normalize("K", os), Err(needs_modifier(os).to_string()), "{os:?}");
             assert_eq!(normalize("Alt+Shift+Escape", os), Err(reserved_panic(os).to_string()), "{os:?}");
         }
+    }
+
+    #[test]
+    fn launch_candidates_start_with_the_configured_shortcut() {
+        assert_eq!(candidates("alt+space")[0], "Alt+Space");
+    }
+
+    /// The port's default is platform-aware (W9), so the chain is asserted by property rather
+    /// than by a fixed list: the configured shortcut first, this platform's default present, no
+    /// bare function key, and no candidate that is another spelling of one already there.
+    #[test]
+    fn launch_candidates_lead_with_the_configured_shortcut_and_this_platforms_default() {
+        let list = candidates("Alt+Space");
+        assert_eq!(list[0], "Alt+Space");
+        assert!(
+            list.iter().any(|option| same_keys(option, Os::CURRENT.default_shortcut())),
+            "the platform default is part of the chain: {list:?}"
+        );
+        assert!(
+            !list.iter().any(|option| option.starts_with('F')),
+            "a global F1 would be taken from every app that uses it, so the chain holds none: {list:?}"
+        );
+        for (index, option) in list.iter().enumerate() {
+            assert!(
+                !list[..index].iter().any(|earlier| same_keys(earlier, option)),
+                "duplicate candidate `{option}` in {list:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn another_spelling_of_a_candidate_is_counted_only_once() {
+        let list = candidates("super+space");
+        assert_eq!(list[0], "Super+Space");
+        assert_eq!(list.iter().skip(1).filter(|option| same_keys(option, "Super+Space")).count(), 0);
+    }
+
+    #[test]
+    fn a_custom_shortcut_gets_the_platform_default_and_then_the_fallbacks() {
+        let list = candidates("Ctrl+Alt+K");
+        assert_eq!(list[0], "Ctrl+Alt+K");
+        assert!(same_keys(&list[1], Os::CURRENT.default_shortcut()));
+        assert!(list.iter().skip(2).eq(FALLBACKS.iter().copied().map(str::to_string)));
+    }
+
+    #[test]
+    fn launch_candidates_keep_the_saved_spelling_when_it_cannot_be_read() {
+        let list = candidates("not a shortcut");
+        assert_eq!(list[0], "not a shortcut");
+        // The unreadable spelling, the platform default, then every fallback.
+        assert_eq!(list.len(), 2 + FALLBACKS.len());
     }
 
     /// Records what `apply` asks of the app, in order.
