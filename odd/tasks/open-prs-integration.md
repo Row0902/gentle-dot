@@ -79,6 +79,23 @@ Three commits exist because the merged PRs alone leave the tree red, and none of
 2. `c752801` — biome's formatter and two unused imports across `bridge.ts`, `config.ts`, `whatsapp-bridge.ts`, `config.test.ts`, `isolation.test.ts` and `runtime-build.test.ts`; the PRs were opened without running `pnpm lint`.
 3. The `shortcut.rs` test type error, fixed inside #70's own merge commit: `list.iter().skip(2).eq(...)` compared `&String` with `&str`.
 
+## Cross-platform CI (fork run `39864521663`, and the re-run after the fixes)
+
+The integration branch was pushed to the fork with the POSIX channel merged in, and the runners found what no local measurement could:
+
+| Job | First run | After the fixes |
+| :--- | :--- | :--- |
+| Rust `windows-latest` | success, 420 tests | — |
+| TypeScript `ubuntu-latest` | success | — |
+| TypeScript `macos-latest` | success | — |
+| TypeScript `windows-latest` | **failure: PR #74** | fixed here |
+| Rust `ubuntu-latest` | **failure: `E0425`** | fixed here |
+| Rust `macos-latest` | **failure: `E0425`** | fixed here |
+
+- **The port did not compile on macOS or Linux at all**, and this is the finding that matters beyond this branch: `src/daemon.rs:491` sits inside `if cfg!(windows)`, and `cfg!()` is a **runtime** test, so both branches are compiled on every platform — while `holds_git` (W31, W34) was behind `#[cfg(windows)]`. `E0425` stopped the build before any other code was reached. Fixed by making the function unconditional, and the same one-line fix is now on `feat/windows-port` (`4b7877d`), because PR #57 claimed a cross-platform build that no runner had ever checked.
+- **PR #74's two boundary tests fail on a Windows runner**: `git rev-parse --show-toplevel` answers with the long path while the fixture's temp folder is `C:\Users\RUNNER~1\…`, and the assertions compared them raw. Fixed with `realpathSync.native`, which expands NTFS 8.3 names; the local machine never saw it because its `TEMP` has no short form.
+- The MCP-proxy `bad port` flake did **not** appear on any runner: that instability is this host's, and the suite is green in CI on ubuntu and macOS — Windows too, after the #74 fix.
+
 ### What this branch does not claim
 
 Nothing here is a macOS or Linux measurement: the macOS-only arms of #56/#77 and the Linux arms of #49/#69 have not been compiled by this run. PR #97's CI (`ci/linux-macos`) is the channel for that, and it is separate on purpose.
