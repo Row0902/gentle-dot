@@ -60,4 +60,25 @@ These are not integration costs. Each one means the PR, as opened, breaks the re
 
 ## Measurement
 
-Filled in by the runs recorded at the end of this branch.
+Windows 11 x86_64, after the merges and the three integration commits (`853ac76`, `c752801`).
+
+| Check | Result | Port baseline (`6b1ccbb`) |
+| :--- | :--- | :--- |
+| `cargo test --lib` | **420 passed / 0 failed / 4 ignored** | 413 passed / 0 failed / 4 ignored |
+| `pnpm typecheck` | **0 errors** | 0 errors |
+| `pnpm lint` | **clean, 225 files** | clean on the tracked tree (locally 3 errors from `apps/engram-guard/target/` and `.atl`, which are build output, not sources) |
+| `pnpm test`, full parallel run | 913 passed / 42 skipped / 956, **1 failed** | same class of flake, documented in the port plan |
+
+The single failure is the class this plan already records, and it is not caused by any merge: `mcp-proxy.test.ts` fails with `TypeError: fetch failed / Error: bad port` from pi-mcp's streamable-http transport, and the previous run failed the same way in `connector-secrets.test.ts` — a different file, same signature. Run in series, both pass: `pnpm vitest run --no-file-parallelism packages/daemon/test/mcp-proxy.test.ts packages/daemon/test/connector-secrets.test.ts` → **32 passed / 1 skipped, exit 0**. The honest baseline for this host is therefore "MCP-proxy tests are unstable under full parallelism, green in series", exactly like the daemon suite the port already documents.
+
+### What the merges cost, in code
+
+Three commits exist because the merged PRs alone leave the tree red, and none of them is a port defect:
+
+1. `853ac76` — the panel's `turn_timeout` branch (#75's missing typecheck case) and the eighth dependency in `runtime-build.test.ts` (#78).
+2. `c752801` — biome's formatter and two unused imports across `bridge.ts`, `config.ts`, `whatsapp-bridge.ts`, `config.test.ts`, `isolation.test.ts` and `runtime-build.test.ts`; the PRs were opened without running `pnpm lint`.
+3. The `shortcut.rs` test type error, fixed inside #70's own merge commit: `list.iter().skip(2).eq(...)` compared `&String` with `&str`.
+
+### What this branch does not claim
+
+Nothing here is a macOS or Linux measurement: the macOS-only arms of #56/#77 and the Linux arms of #49/#69 have not been compiled by this run. PR #97's CI (`ci/linux-macos`) is the channel for that, and it is separate on purpose.
