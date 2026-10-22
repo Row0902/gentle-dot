@@ -21,3 +21,6 @@ packages/*/src/**/*.d.ts
 # Engram memory exports: memory content must never be committed
 /engram-export.json
 /engram-*.json
+
+# Declarations emitted next to sources by accident, except hand-written ones
+!packages/daemon/src/builderbot.d.ts
